@@ -1,0 +1,161 @@
+# Social-PatchTST 模型配置文件
+
+# 数据配置
+data:
+  # 数据路径
+  data_dir: "/mnt/d/model/adsb"
+  train_file: "train_dataset.csv"
+  val_file: "validation_dataset.csv"
+  test_file: "test_dataset.csv"
+
+  # 时间序列参数
+  history_length: 120        # 历史序列长度 (10分钟 * 12点/分钟)
+  prediction_length: 120     # 预测序列长度 (10分钟 * 12点/分钟)
+  sampling_interval: 5       # 采样间隔（秒）
+
+  # 特征列
+  feature_cols:
+    temporal_features:
+      - "flight_level"         # 重要：使用气压高度而不是几何高度
+      - "ground_speed"         # 地速
+      - "track_angle"          # 航向角
+      - "vertical_rate"        # 垂直速度
+      - "selected_altitude"    # 选中高度
+
+    spatial_features:
+      - "latitude"             # 纬度
+      - "longitude"            # 经度
+
+    static_features:
+      - "target_address"       # 飞机地址
+      - "callsign"             # 航班号
+      - "aircraft_type"        # 飞机类型
+
+    target_features:
+      - "flight_level"         # 预测目标：气压高度
+      - "latitude"             # 预测目标：纬度
+      - "longitude"            # 预测目标：经度
+      - "ground_speed"         # 预测目标：地速
+      - "track_angle"          # 预测目标：航向角
+
+# PatchTST 参数
+patchtst:
+  # Patch参数
+  patch_length: 16           # 每个patch的长度
+  stride: 8                  # patch滑动步长
+  padding: 0                 # 填充
+
+  # Transformer参数
+  d_model: 512               # 模型维度
+  n_heads: 8                 # 注意力头数
+  n_layers: 6                # Transformer层数
+  d_ff: 2048                 # 前馈网络维度
+  dropout: 0.1               # Dropout率
+
+  # 归一化
+  norm: "LayerNorm"           # 归一化方式
+  activation: "gelu"         # 激活函数
+
+# Social Transformer 参数
+social_transformer:
+  # 空间注意力参数
+  max_aircrafts: 50          # 最大同时处理的飞机数
+  d_model: 512               # 社交编码器维度（通常与temporal相同）
+  n_heads: 8                 # 社交注意力头数
+  n_layers: 4                # 社交Transformer层数
+  d_ff: 2048                 # 社交前馈网络维度
+  dropout: 0.1               # 社交层Dropout
+
+  # 相对位置编码（RPE）参数
+  rpe:
+    enabled: true             # 启用相对位置编码
+    max_distance: 100        # 最大考虑距离（海里）
+    distance_bins: 20         # 距离分箱数
+    temperature: 1.0         # 注意力温度参数
+
+  # 社交互作阈值
+  interaction_threshold: 10  # 飞机交互距离阈值（海里）
+
+# 预测解码器参数
+decoder:
+  d_model: 512               # 解码器维度
+  n_heads: 8                 # 解码器注意力头数
+  n_layers: 4                # 解码器层数
+  d_ff: 2048                 # 解码器前馈网络维度
+  dropout: 0.1               # 解码器Dropout
+
+# 训练配置
+training:
+  # 基本参数
+  batch_size: 32             # 批大小
+  learning_rate: 0.0001      # 学习率
+  epochs: 100                # 训练轮数
+  patience: 10               # 早停耐心值
+
+  # 优化器
+  optimizer: "AdamW"         # 优化器类型
+  weight_decay: 0.01         # 权重衰减
+
+  # 学习率调度
+  scheduler: "CosineAnnealingLR"  # 学习率调度器
+  T_max: 100                 # 余弦退火周期
+  eta_min: 0.00001           # 最小学习率
+
+  # 损失函数权重
+  loss_weights:
+    position: 1.0            # 位置损失权重
+    velocity: 0.5            # 速度损失权重
+    altitude: 1.0            # 高度损失权重
+    mindist: 2.0             # 最小距离损失权重
+
+# 数据增强
+augmentation:
+  enabled: true              # 启用数据增强
+  noise_std: 0.01            # 高斯噪声标准差
+  time_shift: 2              # 时间偏移（步数）
+  dropout_rate: 0.1          # 特征dropout率
+
+# 评估指标
+metrics:
+  # 位置误差
+  position_error:
+    - "RMSE"                  # 均方根误差
+    - "MAE"                   # 平均绝对误差
+    - "MAPE"                  # 平均绝对百分比误差
+
+  # 速度误差
+  velocity_error:
+    - "RMSE"
+    - "MAE"
+
+  # 高度误差
+  altitude_error:
+    - "RMSE"
+    - "MAE"
+
+  # 安全性指标
+  safety_metrics:
+    - "min_distance_violation_rate"  # 最小距离违规率
+    - "collision_risk_score"         # 碰撞风险评分
+
+# 设备和并行
+device:
+  gpu_ids: [0, 1]            # GPU设备列表
+  num_workers: 4             # 数据加载器工作进程数
+  pin_memory: true           # 是否固定内存
+  mixed_precision: true      # 是否使用混合精度训练
+
+# 日志和保存
+logging:
+  log_dir: "./logs"          # 日志目录
+  tensorboard_dir: "./logs/tensorboard"  # TensorBoard目录
+  print_freq: 100            # 打印频率
+  save_freq: 10              # 模型保存频率（轮）
+  save_best: true            # 是否保存最佳模型
+
+# 推理配置
+inference:
+  batch_size: 64             # 推理批大小
+  max_sequence_length: 300   # 最大序列长度
+  sliding_window: true       # 是否使用滑动窗口
+  overlap: 0.5               # 窗口重叠比例
