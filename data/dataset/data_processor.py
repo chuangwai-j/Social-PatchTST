@@ -1,376 +1,288 @@
+#!/usr/bin/env python3
 """
-数据预处理模块
-负责读取、处理和转换ADS-B数据，使其能够直接输入Social-PatchTST模型
+ADS-B 轨迹数据提取工具 (V7-Social - 场景生成器)
+- 专为 Social-PatchTST 模型设计
+- 废弃 V6 (groupby) 逻辑，采用"世界状态"和"基于场景"的提取
+- 使用 240 点（20分钟）滑动窗口提取"Ego"和"Neighbors"
+- 并行处理以加速
 """
 
 import pandas as pd
 import numpy as np
-import torch
-from torch.utils.data import Dataset, DataLoader
-from sklearn.preprocessing import StandardScaler, LabelEncoder
-from typing import Dict, List, Tuple, Optional, Union
+import os
+import glob
+import argparse
+from datetime import datetime, timedelta
 import warnings
+import random
+from tqdm import tqdm
+from typing import List, Tuple, Optional
+import multiprocessing
+import uuid
+import functools
+import collections
+
 warnings.filterwarnings('ignore')
 
-from config.config_manager import load_config
 
-
-class ADSBDataProcessor:
-    """ADS-B数据预处理器"""
-
-    def __init__(self, config_path: str):
-        """
-        初始化数据处理器
-
-        Args:
-            config_path: 配置文件路径
-        """
-        self.config = load_config(config_path)
-        self.data_config = self.config.data_config
-
-        # 初始化特征列
-        self.temporal_features = self.data_config['feature_cols']['temporal_features']
-        self.spatial_features = self.data_config['feature_cols']['spatial_features']
-        self.static_features = self.data_config['feature_cols']['static_features']
-        self.target_features = self.data_config['feature_cols']['target_features']
-
-        # 所有特征列（用于归一化）
-        self.all_features = self.temporal_features + self.spatial_features
-
-        # 初始化归一化器和编码器
-        self.scalers = {}
-        self.encoders = {}
-        self.is_fitted = False
-
-    def fit_scalers(self, df: pd.DataFrame) -> None:
-        """
-        在训练数据上拟合归一化器和编码器
-
-        Args:
-            df: 训练数据DataFrame
-        """
-        print("拟合数据预处理器...")
-
-        # 为数值特征拟合StandardScaler
-        for feature in self.all_features:
-            if feature in df.columns:
-                self.scalers[feature] = StandardScaler()
-                values = df[feature].values.reshape(-1, 1)
-                self.scalers[feature].fit(values)
-                print(f"  - {feature}: mean={self.scalers[feature].mean_[0]:.3f}, std={self.scalers[feature].scale_[0]:.3f}")
-
-        # 为分类特征拟合LabelEncoder
-        categorical_features = ['aircraft_type']  # 只编码aircraft_type
-        for feature in categorical_features:
-            if feature in df.columns:
-                self.encoders[feature] = LabelEncoder()
-                values = df[feature].astype(str).values
-                self.encoders[feature].fit(values)
-                print(f"  - {feature}: {len(self.encoders[feature].classes_)} 个类别")
-
-        self.is_fitted = True
-        print("数据预处理器拟合完成!")
-
-    def transform_data(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        转换数据（归一化和编码）
-
-        Args:
-            df: 原始DataFrame
-
-        Returns:
-            转换后的DataFrame
-        """
-        if not self.is_fitted:
-            raise ValueError("请先调用 fit_scalers() 拟合预处理器")
-
-        df_transformed = df.copy()
-
-        # 数值特征归一化
-        for feature in self.all_features:
-            if feature in df_transformed.columns and feature in self.scalers:
-                values = df_transformed[feature].values.reshape(-1, 1)
-                df_transformed[feature] = self.scalers[feature].transform(values).flatten()
-
-        # 分类特征编码
-        for feature in ['aircraft_type']:
-            if feature in df_transformed.columns and feature in self.encoders:
-                values = df_transformed[feature].astype(str).values
-                # 处理未见过的类别
-                mask = ~np.isin(values, self.encoders[feature].classes_)
-                if mask.any():
-                    # 将未知类别设为0（第一个类别）
-                    values[mask] = self.encoders[feature].classes_[0]
-                df_transformed[feature] = self.encoders[feature].transform(values)
-
-        return df_transformed
-
-    def calculate_distance(self, lat1: np.ndarray, lon1: np.ndarray, lat2: np.ndarray, lon2: np.ndarray) -> np.ndarray:
-        """
-        计算两点间的大圆距离（海里）
-
-        Args:
-            lat1, lon1: 第一个点的纬度和经度
-            lat2, lon2: 第二个点的纬度和经度
-
-        Returns:
-            距离（海里）
-        """
-        # 转换为弧度
-        lat1, lon1, lat2, lon2 = map(np.radians, [lat1, lon1, lat2, lon2])
-
-        # 使用Haversine公式
-        dlat = lat2 - lat1
-        dlon = lon2 - lon1
-
-        a = np.sin(dlat/2)**2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon/2)**2
-        c = 2 * np.arcsin(np.sqrt(a))
-
-        # 地球半径（海里）
-        earth_radius_nm = 3440.065
-
-        return c * earth_radius_nm
-
-    def create_sequences(self, df: pd.DataFrame) -> Tuple[Dict[str, torch.Tensor], torch.Tensor]:
-        """
-        创建模型输入序列
-
-        Args:
-            df: 处理后的DataFrame
-
-        Returns:
-            输入数据字典和目标张量
-        """
-        history_length = self.data_config['history_length']
-        prediction_length = self.data_config['prediction_length']
-        sequence_length = history_length + prediction_length
-
-        # 按飞机分组
-        grouped = df.groupby('target_address')
-
-        all_inputs = []
-        all_targets = []
-
-        for aircraft_id, group in grouped:
-            if len(group) < sequence_length:
-                continue  # 跳过太短的轨迹
-
-            # 确保数据按时间排序
-            group = group.sort_values('timestamp')
-
-            # 滑动窗口生成序列
-            for i in range(len(group) - sequence_length + 1):
-                sequence = group.iloc[i:i+sequence_length]
-
-                # 检查时间连续性
-                time_diffs = sequence['timestamp'].diff().dropna()
-                if not all(time_diffs <= self.data_config['sampling_interval'] * 1.5):
-                    continue  # 跳过时间不连续的序列
-
-                # 提取特征
-                temporal_data = sequence[self.temporal_features].values
-                spatial_data = sequence[self.spatial_features].values
-                target_data = sequence[self.target_features].values
-
-                # 分离历史和未来
-                history_temporal = temporal_data[:history_length]
-                history_spatial = spatial_data[:history_length]
-                target = target_data[history_length:]  # 未来数据作为目标
-
-                # 构建输入字典
-                inputs = {
-                    'temporal': torch.FloatTensor(history_temporal),
-                    'spatial': torch.FloatTensor(history_spatial),
-                    'aircraft_id': aircraft_id,
-                    'start_time': sequence.iloc[0]['timestamp']
-                }
-
-                all_inputs.append(inputs)
-                all_targets.append(torch.FloatTensor(target))
-
-        if not all_inputs:
-            raise ValueError("没有生成有效的序列数据")
-
-        return all_inputs, all_targets
-
-    def create_multi_aircraft_batch(self, inputs_list: List[Dict], targets_list: List[torch.Tensor],
-                                   max_aircrafts: int = 50) -> Dict[str, torch.Tensor]:
-        """
-        创建多飞机批次数据
-
-        Args:
-            inputs_list: 输入序列列表
-            targets_list: 目标序列列表
-            max_aircrafts: 最大飞机数量
-
-        Returns:
-            批次数据字典
-        """
-        # 随机选择飞机序列
-        if len(inputs_list) > max_aircrafts:
-            indices = np.random.choice(len(inputs_list), max_aircrafts, replace=False)
-            selected_inputs = [inputs_list[i] for i in indices]
-            selected_targets = [targets_list[i] for i in indices]
-        else:
-            selected_inputs = inputs_list
-            selected_targets = targets_list
-
-        # 堆叠数据
-        batch_data = {
-            'temporal': torch.stack([inp['temporal'] for inp in selected_inputs]),
-            'spatial': torch.stack([inp['spatial'] for inp in selected_inputs]),
-            'targets': torch.stack(selected_targets),
-            'aircraft_ids': [inp['aircraft_id'] for inp in selected_inputs],
-            'start_times': [inp['start_time'] for inp in selected_inputs]
-        }
-
-        # 计算飞机间距离矩阵（用于社交注意力）
-        n_aircrafts = len(selected_inputs)
-        if n_aircrafts > 1:
-            positions = []
-            for inp in selected_inputs:
-                # 使用最后一个历史点的位置
-                last_pos = inp['spatial'][-1]  # [lat, lon]
-                positions.append(last_pos.numpy())
-
-            positions = np.array(positions)
-            distances = np.zeros((n_aircrafts, n_aircrafts))
-
-            for i in range(n_aircrafts):
-                for j in range(n_aircrafts):
-                    if i != j:
-                        distances[i, j] = self.calculate_distance(
-                            positions[i, 0], positions[i, 1],
-                            positions[j, 0], positions[j, 1]
-                        )
-
-            batch_data['distance_matrix'] = torch.FloatTensor(distances)
-        else:
-            batch_data['distance_matrix'] = torch.zeros(1, 1)
-
-        return batch_data
-
-
-class ADSBDataset(Dataset):
-    """ADS-B数据集类"""
-
-    def __init__(self, df: pd.DataFrame, processor: ADSBDataProcessor,
-                 max_aircrafts_per_batch: int = 50):
-        """
-        初始化数据集
-
-        Args:
-            df: 原始数据DataFrame
-            processor: 数据处理器
-            max_aircrafts_per_batch: 每批次最大飞机数
-        """
-        self.processor = processor
-        self.max_aircrafts_per_batch = max_aircrafts_per_batch
-
-        # 处理数据
-        print("预处理数据...")
-        self.df_processed = processor.transform_data(df)
-
-        # 创建序列
-        print("创建序列...")
-        self.inputs_list, self.targets_list = processor.create_sequences(self.df_processed)
-        print(f"生成了 {len(self.inputs_list)} 个序列")
-
-        # 分组为批次
-        self.create_batches()
-
-    def create_batches(self):
-        """创建批次"""
-        # 简单的顺序分组
-        batch_size = self.max_aircrafts_per_batch
-        self.batches = []
-
-        for i in range(0, len(self.inputs_list), batch_size):
-            end_idx = min(i + batch_size, len(self.inputs_list))
-            if end_idx - i >= 2:  # 至少需要2架飞机才能有社交交互
-                batch_inputs = self.inputs_list[i:end_idx]
-                batch_targets = self.targets_list[i:end_idx]
-                self.batches.append((batch_inputs, batch_targets))
-
-        print(f"创建了 {len(self.batches)} 个批次")
-
-    def __len__(self):
-        return len(self.batches)
-
-    def __getitem__(self, idx):
-        batch_inputs, batch_targets = self.batches[idx]
-        return self.processor.create_multi_aircraft_batch(
-            batch_inputs, batch_targets, self.max_aircrafts_per_batch
-        )
-
-
-def create_data_loaders(config_path: str, batch_size: int = 32, num_workers: int = 4) -> Tuple[DataLoader, DataLoader, DataLoader]:
+# ==================== 配置参数 ====================
+
+class Config:
+    """配置类 - V7-Social 方案"""
+
+    def __init__(self):
+        # 数据路径
+        self.INPUT_DIR = "/mnt/d/adsb"
+        self.OUTPUT_DIR = "/mnt/d/model/adsb_scenes_v7"  # 【新】V7 场景输出目录
+
+        # 处理参数
+        self.MAX_FILES = 2000
+        self.RESAMPLE_RATE = "5S"
+        self.MIN_TIME_GAP_SECONDS = 180  # 轨迹中断阈值
+
+        # 【V7 窗口参数 - 采纳您的建议】
+        self.SEC_PER_POINT = 5
+        self.HISTORY_POINTS = 120  # 10分钟历史
+        self.FUTURE_POINTS = 120   # 10分钟未来
+        self.MIN_TRACK_POINTS = self.HISTORY_POINTS + self.FUTURE_POINTS  # 240点 (20分钟)
+
+        # 【V7 滑动窗口参数】
+        # 步长：每 50 秒（10个点）生成一个新场景
+        self.SLIDING_WINDOW_STRIDE_POINTS = 10
+
+        # 【V6 黄金数据阈值 - 已废弃】
+        # (我们不再做分类，而是做预测)
+
+        # 列定义 (不变)
+        self.COLUMN_ORDER = [
+            "target_address", "callsign", "timestamp",
+            "latitude", "longitude", "geometric_altitude", "flight_level",
+            "ground_speed", "track_angle", "vertical_rate", "selected_altitude",
+            "lnav_mode", "aircraft_type"
+        ]
+        self.NUMERIC_COLS = [
+            "latitude", "longitude", "geometric_altitude", "flight_level",
+            "ground_speed", "track_angle", "vertical_rate", "selected_altitude"
+        ]
+        self.CATEGORICAL_COLS = ["callsign", "lnav_mode", "aircraft_type"]
+
+
+# ==================== 核心功能函数 ====================
+
+def resample_aircraft_trajectory(group, config):
     """
-    创建训练、验证和测试数据加载器
-
-    Args:
-        config_path: 配置文件路径
-        batch_size: 批大小
-        num_workers: 数据加载器工作进程数
-
-    Returns:
-        训练、验证和测试数据加载器
+    对单架飞机的轨迹进行重采样 (此函数不变，依然重要)
     """
-    config = load_config(config_path)
-    data_config = config.data_config
-
-    # 初始化数据处理器
-    processor = ADSBDataProcessor(config_path)
-
-    # 读取数据
-    print("读取数据文件...")
-    train_df = pd.read_csv(f"{data_config['data_dir']}/{data_config['train_file']}")
-    val_df = pd.read_csv(f"{data_config['data_dir']}/{data_config['val_file']}")
-    test_df = pd.read_csv(f"{data_config['data_dir']}/{data_config['test_file']}")
-
-    print(f"训练集: {len(train_df)} 行")
-    print(f"验证集: {len(val_df)} 行")
-    print(f"测试集: {len(test_df)} 行")
-
-    # 在训练数据上拟合预处理器
-    processor.fit_scalers(train_df)
-
-    # 创建数据集
-    train_dataset = ADSBDataset(train_df, processor)
-    val_dataset = ADSBDataset(val_df, processor)
-    test_dataset = ADSBDataset(test_df, processor)
-
-    # 创建数据加载器
-    train_loader = DataLoader(
-        train_dataset, batch_size=1, shuffle=True, num_workers=num_workers, pin_memory=True
-    )
-    val_loader = DataLoader(
-        val_dataset, batch_size=1, shuffle=False, num_workers=num_workers, pin_memory=True
-    )
-    test_loader = DataLoader(
-        test_dataset, batch_size=1, shuffle=False, num_workers=num_workers, pin_memory=True
-    )
-
-    return train_loader, val_loader, test_loader, processor
+    if len(group) < 2:
+        return pd.DataFrame()
+    group = group.drop_duplicates(subset=['timestamp'], keep='last')
+    if len(group) < 2:
+        return pd.DataFrame()
+    base_time = datetime(2025, 1, 1)
+    timestamps = [base_time + timedelta(seconds=float(ts)) for ts in group['timestamp']]
+    group = group.copy()
+    group['datetime'] = timestamps
+    group = group.set_index('datetime').sort_index()
+    resampled_numeric = group[config.NUMERIC_COLS].resample(config.RESAMPLE_RATE).interpolate(method='linear')
+    resampled_categorical = group[config.CATEGORICAL_COLS].resample(config.RESAMPLE_RATE).interpolate(method='pad')
+    resampled_group = pd.concat([resampled_numeric, resampled_categorical], axis=1)
+    target_address = group['target_address'].iloc[0]
+    resampled_group['target_address'] = target_address
+    resampled_group['timestamp'] = (resampled_group.index - base_time).total_seconds()
+    resampled_group = resampled_group.fillna(method='bfill').dropna()
+    resampled_group = resampled_group.reset_index(drop=True)
+    resampled_group = resampled_group[config.COLUMN_ORDER]
+    return resampled_group
 
 
-if __name__ == "__main__":
-    # 测试数据处理器
-    config_path = "../config/social_patchtst_config.yaml"
+# ==================== V7-Social 并行工作函数 ====================
 
+def generate_scenes_from_file(filepath, config):
+    """
+    【V7 核心逻辑】
+    处理单个文件，提取所有 "Ego-Neighbors" 场景
+    """
+    scenes_generated_count = 0
     try:
-        train_loader, val_loader, test_loader, processor = create_data_loaders(config_path)
-        print("数据加载器创建成功!")
+        df = pd.read_csv(filepath)
+        if df.empty:
+            return 0
 
-        # 测试一个批次
-        batch = next(iter(train_loader))
-        print(f"批次数据键: {batch.keys()}")
-        print(f"时序数据形状: {batch['temporal'].shape}")
-        print(f"空间数据形状: {batch['spatial'].shape}")
-        print(f"目标数据形状: {batch['targets'].shape}")
-        print(f"距离矩阵形状: {batch['distance_matrix'].shape}")
+        # --- 1. 构建"世界状态" ---
+        # (与V6不同) 我们不 groupby，我们重采样文件中的 *所有* 飞机
+        required_cols = ['target_address', 'callsign', 'timestamp'] + config.NUMERIC_COLS + config.CATEGORICAL_COLS
+        if not all(col in df.columns for col in required_cols):
+            return 0
+
+        resampled_trajectories = []
+        for target_address, group in df.groupby('target_address'):
+            resampled_track = resample_aircraft_trajectory(group, config)
+            if not resampled_track.empty:
+                resampled_trajectories.append(resampled_track)
+
+        if not resampled_trajectories:
+            return 0
+
+        # world_state_df 包含了此文件中所有飞机的、5秒间隔的、连续的轨迹数据
+        world_state_df = pd.concat(resampled_trajectories, ignore_index=True).sort_values(by='timestamp')
+        if world_state_df.empty:
+            return 0
+
+        # --- 2. 识别"Ego"飞机的长轨迹段 ---
+        # 在这里，我们才 groupby 来识别 *连续* 的轨迹
+
+        # 按飞机和时间排序
+        world_state_df = world_state_df.sort_values(by=['target_address', 'timestamp'])
+        # 识别轨迹中断
+        world_state_df['time_gap'] = world_state_df.groupby('target_address')['timestamp'].diff()
+        world_state_df['segment_id'] = (world_state_df['time_gap'] > config.MIN_TIME_GAP_SECONDS).cumsum()
+
+        # 遍历 *所有* 连续轨迹段
+        for (target_address, segment_id), segment in world_state_df.groupby(['target_address', 'segment_id']):
+
+            # --- 3. 应用"滑动窗口" ---
+            # 如果这个连续轨迹段足够长，我们就可以在上面"滑动"240点的窗口
+            if len(segment) >= config.MIN_TRACK_POINTS:
+
+                # 在这个长轨迹段上滑动
+                for i in range(0, len(segment) - config.MIN_TRACK_POINTS + 1, config.SLIDING_WINDOW_STRIDE_POINTS):
+
+                    ego_track = segment.iloc[i : i + config.MIN_TRACK_POINTS]
+
+                    # 确保窗口是完整的240点
+                    if len(ego_track) != config.MIN_TRACK_POINTS:
+                        continue
+
+                    t_start = ego_track['timestamp'].min()
+                    t_end = ego_track['timestamp'].max()
+                    ego_id = ego_track['target_address'].iloc[0]
+
+                    # --- 4. 注入"Social"信息 (查找邻居) ---
+                    # 返回"世界状态"，查找在 *同一时间窗口* 内的所有 *其他* 飞机
+
+                    neighbors_df = world_state_df[
+                        (world_state_df['timestamp'] >= t_start) &
+                        (world_state_df['timestamp'] <= t_end) &
+                        (world_state_df['target_address'] != ego_id)
+                    ]
+
+                    # --- 5. 清洗和保存"场景" ---
+                    # 我们只保留那些 *完整* 存在于此 240 点窗口的邻居
+                    complete_neighbors = []
+                    for neighbor_id, neighbor_track in neighbors_df.groupby('target_address'):
+                        if len(neighbor_track) == config.MIN_TRACK_POINTS:
+                            complete_neighbors.append(neighbor_track)
+
+                    # 【重要】我们只保存有"交互"的场景，即至少有1个邻居
+                    if not complete_neighbors:
+                        continue
+
+                    # 创建场景目录
+                    scene_id = str(uuid.uuid4())
+                    scene_dir = os.path.join(config.OUTPUT_DIR, "scenes", scene_id)
+                    os.makedirs(scene_dir, exist_ok=True)
+
+                    # 保存 Ego 轨迹
+                    ego_track.to_csv(os.path.join(scene_dir, "ego.csv"), index=False)
+
+                    # 保存所有邻居的轨迹
+                    final_neighbors_df = pd.concat(complete_neighbors, ignore_index=True)
+                    final_neighbors_df.to_csv(os.path.join(scene_dir, "neighbors.csv"), index=False)
+
+                    scenes_generated_count += 1
 
     except Exception as e:
-        print(f"测试失败: {e}")
-        import traceback
-        traceback.print_exc()
+        print(f"  处理文件 {os.path.basename(filepath)} 时出错: {e}")
+        pass
+
+    return scenes_generated_count
+
+
+# ==================== 主处理函数 (并行版) ====================
+
+def process_adsb_data(config):
+    """
+    主处理函数 (V7 - 并行场景生成器)
+    """
+    print("=== ADS-B 场景数据提取 - V7-Social (240点) ===")
+    print(f"最小轨迹长度: {config.MIN_TRACK_POINTS} 点 ({config.MIN_TRACK_POINTS * config.SEC_PER_POINT / 60:.0f} 分钟)")
+    print(f"滑动窗口步长: {config.SLIDING_WINDOW_STRIDE_POINTS} 点 ({config.SLIDING_WINDOW_STRIDE_POINTS * config.SEC_PER_POINT} 秒)")
+    print(f"处理文件数: {config.MAX_FILES}")
+
+    # --- 1. 创建输出目录结构 ---
+    # 我们只需要一个总的 'scenes' 目录
+    scenes_output_dir = os.path.join(config.OUTPUT_DIR, "scenes")
+    os.makedirs(scenes_output_dir, exist_ok=True)
+    print(f"场景将保存到: {scenes_output_dir}")
+
+    # --- 2. 获取所有数据文件 ---
+    all_files = sorted(glob.glob(os.path.join(config.INPUT_DIR, "*.csv")))
+    if not all_files:
+        print(f"错误：在 {config.INPUT_DIR} 中未找到任何 .csv 文件。")
+        return
+
+    print(f"找到 {len(all_files)} 个数据文件")
+    files_to_process = all_files[:config.MAX_FILES]
+    print(f"处理 {len(files_to_process)} 个文件...")
+
+    # --- 3. 设置并行池 ---
+    num_cores = multiprocessing.cpu_count()
+    print(f"使用 {num_cores} 个CPU核心并行处理...")
+
+    # "固定" config 参数
+    task_processor = functools.partial(generate_scenes_from_file, config=config)
+
+    total_scenes = 0
+
+    with multiprocessing.Pool(num_cores) as pool:
+        for scenes_count in tqdm(pool.imap_unordered(task_processor, files_to_process),
+                                 total=len(files_to_process), desc="并行处理文件"):
+            total_scenes += scenes_count
+
+    # --- 5. 打印最终报告 ---
+    print("\n\n--- ✅ 全部处理完毕 (V7-Social) ---")
+    print(f"数据已保存到: {scenes_output_dir}")
+    print("\n=== 最终数据集统计 ===")
+    print(f"总计生成场景数: {total_scenes:,} 个")
+    print("每个场景包含一个 'ego.csv' (240点) 和一个 'neighbors.csv' (N*240点)")
+    print(f"\n🎯 V7-Social 场景数据生成完毕！")
+    print(f"💡 提示：您的 Social-PatchTST 模型现在可以读取这些场景目录进行训练了。")
+
+
+# ==================== 命令行接口 ====================
+
+def main():
+    """
+    主函数 - 支持命令行参数
+    """
+    parser = argparse.ArgumentParser(description='ADS-B 场景数据提取工具 (V7-Social)')
+    parser.add_argument('--input-dir', default='/mnt/d/adsb', help='输入数据目录')
+    parser.add_argument('--output-dir', default='/mnt/d/model/adsb_scenes_v7', help='输出最终场景的根目录')
+    parser.add_argument('--max-files', type=int, default=2000, help='最大处理文件数量')
+    parser.add_argument('--stride', type=int, default=10, help='滑动窗口步长 (点数, 默认10点 = 50秒)')
+
+    args = parser.parse_args()
+
+    # 创建配置对象
+    config = Config()
+
+    # 应用命令行参数
+    config.INPUT_DIR = args.input_dir
+    config.OUTPUT_DIR = args.output_dir
+    config.MAX_FILES = args.max_files
+    config.SLIDING_WINDOW_STRIDE_POINTS = args.stride
+
+    # 重新计算相关参数
+    config.SEC_PER_POINT = int(config.RESAMPLE_RATE[:-1]) if config.RESAMPLE_RATE.endswith('S') else 5
+    config.HISTORY_POINTS = 120
+    config.FUTURE_POINTS = 120
+    config.MIN_TRACK_POINTS = config.HISTORY_POINTS + config.FUTURE_POINTS
+
+    # 开始处理
+    process_adsb_data(config)
+
+
+# ==================== 程序入口 ====================
+
+if __name__ == "__main__":
+    main()

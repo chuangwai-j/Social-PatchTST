@@ -20,7 +20,7 @@ import numpy as np
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from model import SocialPatchTST, create_model
-from data.dataset import create_data_loaders
+from data.dataset import create_data_loaders, SceneDataset
 from config.config_manager import load_config
 
 
@@ -48,12 +48,28 @@ class Trainer:
         model_info = self.model.get_model_info()
         self.logger.info(f"模型信息: {model_info}")
 
-        # 创建数据加载器
-        self.train_loader, self.val_loader, self.test_loader, self.processor = create_data_loaders(
-            config_path,
-            batch_size=1,  # 数据加载器已经按批次组织
-            num_workers=self.config.get('device.num_workers', 4)
-        )
+        # 创建场景数据加载器
+        scenes_dir = self.config.get('data.scenes_dir', '/tmp/test_scenes')
+
+        # 检查场景目录是否存在
+        if not os.path.exists(scenes_dir):
+            self.logger.error(f"场景数据目录不存在: {scenes_dir}")
+            self.logger.error("请先运行场景数据生成器:")
+            self.logger.error(f"python data/dataset/data_processor.py --input-dir /mnt/d/adsb --output-dir {os.path.dirname(scenes_dir)}")
+            raise FileNotFoundError(f"场景数据目录不存在: {scenes_dir}")
+
+        try:
+            self.train_loader, self.val_loader, self.test_loader = create_data_loaders(
+                config_path,
+                scenes_dir=scenes_dir,
+                batch_size=self.config.get('training.batch_size', 4),
+                max_neighbors=self.config.get('social_transformer.max_aircrafts', 50),
+                num_workers=self.config.get('device.num_workers', 4)
+            )
+        except Exception as e:
+            self.logger.error(f"创建数据加载器失败: {e}")
+            self.logger.error("请确保场景数据已正确生成")
+            raise
 
         # 设置优化器和学习率调度器
         self.setup_optimizer_scheduler()
@@ -363,11 +379,45 @@ def main():
                        help='配置文件路径')
     parser.add_argument('--resume', action='store_true',
                        help='从检查点恢复训练')
+    parser.add_argument('--test', action='store_true',
+                       help='运行测试模式而不是训练')
+    parser.add_argument('--scenes_dir', type=str,
+                       help='场景数据目录路径')
 
     args = parser.parse_args()
 
     if not os.path.exists(args.config):
         print(f"配置文件不存在: {args.config}")
+        return
+
+    # 如果指定了测试模式
+    if args.test:
+        from data.dataset import SceneDataset
+        from config.config_manager import load_config
+
+        config = load_config(args.config)
+        scenes_dir = args.scenes_dir or config.data_config.get('scenes_dir', '/tmp/test_scenes')
+
+        print(f"测试场景数据加载...")
+        print(f"场景目录: {scenes_dir}")
+
+        dataset = SceneDataset(
+            scenes_data=scenes_dir,
+            config_path=args.config,
+            max_neighbors=10
+        )
+
+        print(f"数据集大小: {len(dataset)}")
+
+        if len(dataset) > 0:
+            sample = dataset[0]
+            print(f"样本形状:")
+            print(f"  - 时序数据: {sample['temporal'].shape}")
+            print(f"  - 空间数据: {sample['spatial'].shape}")
+            print(f"  - 目标数据: {sample['targets'].shape}")
+            print(f"  - 距离矩阵: {sample['distance_matrix'].shape}")
+
+        print("✅ 测试完成!")
         return
 
     # 创建训练器

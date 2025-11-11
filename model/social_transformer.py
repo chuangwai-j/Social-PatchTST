@@ -113,7 +113,9 @@ class SocialEncoder(nn.Module):
 
             # 创建交互掩码
             from .relative_position_encoding import RelativePositionEncoding
-            rpe = RelativePositionEncoding(self.d_model, **self.rpe_config)
+            # 过滤掉不支持的参数
+            rpe_params = {k: v for k, v in self.rpe_config.items() if k in ['max_distance', 'distance_bins']}
+            rpe = RelativePositionEncoding(self.d_model, **rpe_params)
             interaction_mask = rpe.get_interaction_mask(
                 distance_matrix_expanded, self.interaction_threshold
             )

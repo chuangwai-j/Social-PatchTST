@@ -17,7 +17,7 @@ from tqdm import tqdm
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from model import SocialPatchTST, create_model
-from data.dataset import ADSBDataProcessor
+from data.dataset import SceneDataset, create_data_loaders
 from config.config_manager import load_config
 
 
@@ -62,8 +62,44 @@ class Predictor:
 
         self.model.eval()
 
-        # 创建数据处理器
-        self.processor = ADSBDataProcessor(config_path)
+        # 场景架构不需要单独的数据处理器，预处理在数据集中完成
+
+    def predict_from_batch(self, batch_data: dict) -> dict:
+        """
+        从批次数据预测
+
+        Args:
+            batch_data: 包含模型输入的字典
+
+        Returns:
+            预测结果字典
+        """
+        start_time = time.time()
+
+        with torch.no_grad():
+            # 将数据移动到设备
+            device_batch = {}
+            for key, value in batch_data.items():
+                if isinstance(value, torch.Tensor):
+                    device_batch[key] = value.to(self.device)
+                else:
+                    device_batch[key] = value
+
+            # 模型预测
+            predictions = self.model(device_batch)
+
+            # 将结果移回CPU
+            if isinstance(predictions, torch.Tensor):
+                predictions = predictions.cpu().numpy()
+
+        inference_time = time.time() - start_time
+
+        return {
+            'predictions': predictions,
+            'inference_time': inference_time,
+            'n_aircrafts': batch_data['temporal'].shape[1],
+            'prediction_length': predictions.shape[2] if len(predictions.shape) > 2 else None
+        }
 
     def _setup_device(self) -> torch.device:
         """设置推理设备"""
@@ -320,12 +356,12 @@ def main():
     """主函数"""
     parser = argparse.ArgumentParser(description='Social-PatchTST推理')
     parser.add_argument('--config', type=str,
-                       default='../config/social_patchtst_config.yaml',
+                       default='config/social_patchtst_config.yaml',
                        help='配置文件路径')
     parser.add_argument('--model', type=str,
                        help='模型权重路径')
-    parser.add_argument('--input', type=str, required=True,
-                       help='输入数据文件路径')
+    parser.add_argument('--input', type=str,
+                       help='输入数据文件路径或场景目录')
     parser.add_argument('--output', type=str,
                        default='./predictions.csv',
                        help='输出文件路径')
@@ -333,35 +369,68 @@ def main():
                        help='最大飞机数量')
     parser.add_argument('--visualize', action='store_true',
                        help='是否可视化预测结果')
+    parser.add_argument('--scenes_dir', type=str,
+                       help='场景数据目录路径')
+    parser.add_argument('--batch_predict', action='store_true',
+                       help='批量预测场景数据')
 
     args = parser.parse_args()
 
-    if not os.path.exists(args.input):
-        print(f"输入文件不存在: {args.input}")
+    # 如果是批量预测模式
+    if args.batch_predict and args.scenes_dir:
+        from data.dataset import SceneDataset
+
+        print(f"批量预测模式...")
+        print(f"场景目录: {args.scenes_dir}")
+
+        dataset = SceneDataset(
+            scenes_data=args.scenes_dir,
+            config_path=args.config,
+            max_neighbors=args.max_aircrafts
+        )
+
+        print(f"找到 {len(dataset)} 个场景")
+
+        if len(dataset) > 0:
+            # 创建预测器
+            predictor = Predictor(args.config, args.model)
+
+            # 批量预测
+            all_predictions = []
+            for i, sample in enumerate(dataset):
+                print(f"预测场景 {i+1}/{len(dataset)}")
+                pred = predictor.predict_from_batch(sample)
+                all_predictions.append(pred)
+
+            print(f"批量预测完成! 预测了 {len(all_predictions)} 个场景")
+
         return
 
-    # 创建预测器
-    predictor = Predictor(args.config, args.model)
+    # 单文件预测模式
+    if args.input and os.path.exists(args.input):
+        print(f"读取输入数据: {args.input}")
+        df = pd.read_csv(args.input)
 
-    # 读取输入数据
-    print(f"读取输入数据: {args.input}")
-    df = pd.read_csv(args.input)
+        # 创建预测器
+        predictor = Predictor(args.config, args.model)
 
-    # 进行预测
-    result = predictor.predict_from_dataframe(df, args.max_aircrafts)
+        # 进行预测
+        result = predictor.predict_from_dataframe(df, args.max_aircrafts)
 
-    print(f"预测完成!")
-    print(f"推理时间: {result['inference_time']:.3f}秒")
-    print(f"飞机数量: {result['n_aircrafts']}")
-    print(f"预测长度: {result['prediction_length']}个时间步")
-    print(f"预测结果形状: {result['predictions'].shape}")
+        print(f"预测完成!")
+        print(f"推理时间: {result['inference_time']:.3f}秒")
+        print(f"飞机数量: {result['n_aircrafts']}")
+        print(f"预测长度: {result['prediction_length']}个时间步")
+        print(f"预测结果形状: {result['predictions'].shape}")
 
-    # 保存预测结果
-    predictor.save_predictions(result['predictions'], args.output)
+        # 保存预测结果
+        predictor.save_predictions(result['predictions'], args.output)
 
-    # 可视化
-    if args.visualize:
-        predictor.visualize_predictions(result['predictions'])
+        # 可视化
+        if args.visualize:
+            predictor.visualize_predictions(result['predictions'])
+    else:
+        print("请提供输入数据文件路径或使用 --batch_predict --scenes_dir 进行批量预测")
 
     print(f"预测完成，结果已保存到: {args.output}")
 
