@@ -201,6 +201,28 @@ class Trainer:
                     output['predictions'], batch['targets'], batch['distance_matrix']
                 )
 
+            # V9: 应用样本权重
+            if 'sample_weight' in batch:
+                sample_weights = batch['sample_weight'].to(self.device)
+                # 对每个损失项应用样本权重
+                for loss_name in losses:
+                    if loss_name != 'total_loss':  # total_loss会在compute_loss中重新计算
+                        losses[loss_name] = losses[loss_name] * sample_weights.mean()
+
+                # 重新计算加权的总损失
+                loss_weights = self.config.get('training.loss_weights', {})
+                position_weight = loss_weights.get('position', 1.0)
+                altitude_weight = loss_weights.get('altitude', 1.0)
+                velocity_weight = loss_weights.get('velocity', 0.5)
+                mindist_weight = loss_weights.get('mindist', 2.0)
+
+                losses['total_loss'] = (
+                    position_weight * losses['position_loss'] +
+                    altitude_weight * losses['altitude_loss'] +
+                    velocity_weight * losses['velocity_loss'] +
+                    mindist_weight * losses['mindist_loss']
+                )
+
             # 反向传播
             self.optimizer.zero_grad()
 

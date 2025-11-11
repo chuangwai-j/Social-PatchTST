@@ -11,6 +11,7 @@ from sklearn.preprocessing import StandardScaler, LabelEncoder
 from typing import Dict, List, Tuple, Optional
 import os
 import glob
+import json
 import warnings
 from config.config_manager import load_config
 
@@ -169,6 +170,48 @@ class SceneDataset(Dataset):
 
         return distance_matrix
 
+    def _calculate_v9_sample_weights(self, metadata: dict, n_neighbors: int, distance_matrix: np.ndarray) -> Tuple[str, float]:
+        """
+        V9课程学习样本权重计算
+
+        Args:
+            metadata: 场景元数据
+            n_neighbors: 邻居数量
+            distance_matrix: 距离矩阵
+
+        Returns:
+            tuple: (场景类别, 样本权重)
+        """
+        # 获取配置
+        sample_weights_config = self.config.get('training.sample_weights', {})
+        loss_scaling = sample_weights_config.get('loss_scaling', {
+            'solo': 0.8,
+            'low_risk': 1.2,
+            'high_risk': 1.5
+        })
+
+        # 如果有V9 metadata，优先使用
+        if metadata:
+            mindist = metadata.get('mindist_nm', 9999.0)
+            if mindist == 9999.0:
+                return 'solo', loss_scaling.get('solo', 0.8)
+            elif mindist < 30.0:
+                return 'high_risk', loss_scaling.get('high_risk', 1.5)
+            else:
+                return 'low_risk', loss_scaling.get('low_risk', 1.2)
+
+        # 后备方案：根据邻居数量和距离矩阵计算
+        if n_neighbors == 0:
+            return 'solo', loss_scaling.get('solo', 0.8)
+
+        # 计算最小距离（排除ego到自己的距离）
+        min_dist = distance_matrix[0, 1:].min() if distance_matrix.shape[0] > 1 else 9999.0
+
+        if min_dist < 30.0:
+            return 'high_risk', loss_scaling.get('high_risk', 1.5)
+        else:
+            return 'low_risk', loss_scaling.get('low_risk', 1.2)
+
     def _haversine_distance(self, lat1: float, lon1: float, lat2: float, lon2: float) -> float:
         """计算两点间的大圆距离（海里）"""
         # 转换为弧度
@@ -200,12 +243,21 @@ class SceneDataset(Dataset):
                 - targets: (max_aircrafts, future_length, n_target_features)
                 - distance_matrix: (max_aircrafts, max_aircrafts)
                 - mask: (max_aircrafts,) 标记哪些位置是有效数据
+                - sample_weight: (1,) 样本权重 (V9课程学习)
+                - scene_category: str 场景类别 (solo/low_risk/high_risk)
         """
         scene_path = self.scene_dirs[idx]
 
         # 读取数据
         ego_df = pd.read_csv(os.path.join(scene_path, "ego.csv"))
         neighbors_df = pd.read_csv(os.path.join(scene_path, "neighbors.csv"))
+
+        # 读取V9 metadata (如果存在)
+        metadata = {}
+        metadata_path = os.path.join(scene_path, "metadata.json")
+        if os.path.exists(metadata_path):
+            with open(metadata_path, 'r') as f:
+                metadata = json.load(f)
 
         # 数据预处理
         ego_df = self._transform_data(ego_df)
@@ -252,7 +304,9 @@ class SceneDataset(Dataset):
 
         # 构建批次数据
         n_aircrafts = len(neighbor_data) + 1  # +1 for ego
-        max_aircrafts = min(n_aircrafts, self.max_neighbors + 1)
+
+        # 始终使用固定的max_aircrafts，确保batch内tensor形状一致
+        max_aircrafts = self.max_neighbors + 1
 
         # 初始化张量
         n_temporal = len(self.temporal_features)
@@ -288,13 +342,21 @@ class SceneDataset(Dataset):
         actual_size = distance_matrix.shape[0]
         full_distance_matrix[:actual_size, :actual_size] = torch.FloatTensor(distance_matrix)
 
+        # V9: 计算样本权重和场景分类
+        scene_category, sample_weight = self._calculate_v9_sample_weights(
+            metadata, len(neighbor_data), distance_matrix
+        )
+
         return {
             'temporal': temporal_tensor,
             'spatial': spatial_tensor,
             'targets': targets_tensor,
             'distance_matrix': full_distance_matrix,
             'mask': mask,
-            'scene_id': os.path.basename(scene_path)
+            'scene_id': os.path.basename(scene_path),
+            'sample_weight': torch.FloatTensor([sample_weight]),
+            'scene_category': scene_category,
+            'mindist': metadata.get('mindist_nm', distance_matrix[0, 1:].min() if len(neighbor_data) > 0 else 9999.0)
         }
 
 

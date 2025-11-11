@@ -107,6 +107,25 @@ training:
     altitude: 1.0            # 高度损失权重
     mindist: 2.0             # 最小距离损失权重
 
+  # V9 课程学习样本权重
+  sample_weights:
+    # 根据mindist区间定义样本权重
+    solo: 1.0               # 独自飞行场景 (mindist = 9999)
+    low_risk: 1.5           # 低风险场景 (30-50 NM)
+    high_risk: 2.0          # 高风险场景 (<30 NM)
+
+    # 分层采样比例
+    stratified_ratios:
+      solo: 0.4             # 独自飞行场景比例
+      low_risk: 0.3         # 低风险场景比例
+      high_risk: 0.3        # 高风险场景比例
+
+    # 损失加权系数 (根据分层重要性调整)
+    loss_scaling:
+      solo: 0.8             # 基础物理学习权重
+      low_risk: 1.2         # 社交交互学习权重
+      high_risk: 1.5        # 冲突避让学习权重
+
 # 数据增强
 augmentation:
   enabled: true              # 启用数据增强

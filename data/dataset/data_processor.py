@@ -95,21 +95,67 @@ def resample_aircraft_trajectory(group, config):
     return resampled_group
 
 
-# ==================== V7-Social 并行工作函数 ====================
+# ==================== V9-Social 并行工作函数 ====================
+
+def calculate_min_distance(ego_lat, ego_lon, neighbor_data):
+    """
+    计算Ego与所有邻居之间的最小距离（海里）
+
+    Args:
+        ego_lat: Ego飞机的纬度数组
+        ego_lon: Ego飞机的经度数组
+        neighbor_data: 邻居飞机数据DataFrame
+
+    Returns:
+        float: 最小距离（海里）
+    """
+    if neighbor_data.empty:
+        return 9999.0  # 独自飞行场景
+
+    min_distance = float('inf')
+
+    for neighbor_id, neighbor_group in neighbor_data.groupby('target_address'):
+        if len(neighbor_group) != len(ego_lat):
+            continue  # 长度不匹配，跳过
+
+        neighbor_lat = neighbor_group['latitude'].values
+        neighbor_lon = neighbor_group['longitude'].values
+
+        # 计算每个时间点的距离
+        for i in range(len(ego_lat)):
+            # Haversine公式计算距离
+            lat1, lon1 = np.radians(ego_lat[i]), np.radians(ego_lon[i])
+            lat2, lon2 = np.radians(neighbor_lat[i]), np.radians(neighbor_lon[i])
+
+            dlat = lat2 - lat1
+            dlon = lon2 - lon1
+
+            a = np.sin(dlat/2)**2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon/2)**2
+            c = 2 * np.arcsin(np.sqrt(a))
+
+            # 地球半径（海里）
+            earth_radius_nm = 3440.065
+            distance = c * earth_radius_nm
+
+            if distance < min_distance:
+                min_distance = distance
+
+    return min_distance
 
 def generate_scenes_from_file(filepath, config):
     """
-    【V7 核心逻辑】
-    处理单个文件，提取所有 "Ego-Neighbors" 场景
+    【V9 核心逻辑】
+    处理单个文件，提取所有场景（包括独自飞行）
     """
     scenes_generated_count = 0
+    solo_scenes_count = 0
+
     try:
         df = pd.read_csv(filepath)
         if df.empty:
             return 0
 
         # --- 1. 构建"世界状态" ---
-        # (与V6不同) 我们不 groupby，我们重采样文件中的 *所有* 飞机
         required_cols = ['target_address', 'callsign', 'timestamp'] + config.NUMERIC_COLS + config.CATEGORICAL_COLS
         if not all(col in df.columns for col in required_cols):
             return 0
@@ -123,17 +169,12 @@ def generate_scenes_from_file(filepath, config):
         if not resampled_trajectories:
             return 0
 
-        # world_state_df 包含了此文件中所有飞机的、5秒间隔的、连续的轨迹数据
         world_state_df = pd.concat(resampled_trajectories, ignore_index=True).sort_values(by='timestamp')
         if world_state_df.empty:
             return 0
 
         # --- 2. 识别"Ego"飞机的长轨迹段 ---
-        # 在这里，我们才 groupby 来识别 *连续* 的轨迹
-
-        # 按飞机和时间排序
         world_state_df = world_state_df.sort_values(by=['target_address', 'timestamp'])
-        # 识别轨迹中断
         world_state_df['time_gap'] = world_state_df.groupby('target_address')['timestamp'].diff()
         world_state_df['segment_id'] = (world_state_df['time_gap'] > config.MIN_TIME_GAP_SECONDS).cumsum()
 
@@ -141,15 +182,12 @@ def generate_scenes_from_file(filepath, config):
         for (target_address, segment_id), segment in world_state_df.groupby(['target_address', 'segment_id']):
 
             # --- 3. 应用"滑动窗口" ---
-            # 如果这个连续轨迹段足够长，我们就可以在上面"滑动"240点的窗口
             if len(segment) >= config.MIN_TRACK_POINTS:
 
-                # 在这个长轨迹段上滑动
                 for i in range(0, len(segment) - config.MIN_TRACK_POINTS + 1, config.SLIDING_WINDOW_STRIDE_POINTS):
 
                     ego_track = segment.iloc[i : i + config.MIN_TRACK_POINTS]
 
-                    # 确保窗口是完整的240点
                     if len(ego_track) != config.MIN_TRACK_POINTS:
                         continue
 
@@ -158,24 +196,27 @@ def generate_scenes_from_file(filepath, config):
                     ego_id = ego_track['target_address'].iloc[0]
 
                     # --- 4. 注入"Social"信息 (查找邻居) ---
-                    # 返回"世界状态"，查找在 *同一时间窗口* 内的所有 *其他* 飞机
-
                     neighbors_df = world_state_df[
                         (world_state_df['timestamp'] >= t_start) &
                         (world_state_df['timestamp'] <= t_end) &
                         (world_state_df['target_address'] != ego_id)
                     ]
 
-                    # --- 5. 清洗和保存"场景" ---
-                    # 我们只保留那些 *完整* 存在于此 240 点窗口的邻居
+                    # --- 5. 【V9新增】计算mindist ---
+                    ego_lat = ego_track['latitude'].values
+                    ego_lon = ego_track['longitude'].values
+                    scene_mindist = calculate_min_distance(ego_lat, ego_lon, neighbors_df)
+
+                    # --- 6. 清洗和保存"场景" ---
+                    # V9: 保存所有场景，不再只保留有邻居的
                     complete_neighbors = []
                     for neighbor_id, neighbor_track in neighbors_df.groupby('target_address'):
                         if len(neighbor_track) == config.MIN_TRACK_POINTS:
                             complete_neighbors.append(neighbor_track)
 
-                    # 【重要】我们只保存有"交互"的场景，即至少有1个邻居
-                    if not complete_neighbors:
-                        continue
+                    # 【V9修改】移除必须要有邻居的检查
+                    # if not complete_neighbors:
+                    #     continue
 
                     # 创建场景目录
                     scene_id = str(uuid.uuid4())
@@ -185,29 +226,50 @@ def generate_scenes_from_file(filepath, config):
                     # 保存 Ego 轨迹
                     ego_track.to_csv(os.path.join(scene_dir, "ego.csv"), index=False)
 
-                    # 保存所有邻居的轨迹
-                    final_neighbors_df = pd.concat(complete_neighbors, ignore_index=True)
-                    final_neighbors_df.to_csv(os.path.join(scene_dir, "neighbors.csv"), index=False)
+                    # 保存邻居轨迹（如果有的话）
+                    if complete_neighbors:
+                        final_neighbors_df = pd.concat(complete_neighbors, ignore_index=True)
+                        final_neighbors_df.to_csv(os.path.join(scene_dir, "neighbors.csv"), index=False)
 
-                    scenes_generated_count += 1
+                    # 【V9新增】保存元数据
+                    metadata = {
+                        'scene_id': scene_id,
+                        'mindist_nm': scene_mindist,
+                        'n_neighbors': len(complete_neighbors),
+                        'has_interaction': len(complete_neighbors) > 0,
+                        'ego_id': ego_id,
+                        'start_time': t_start,
+                        'end_time': t_end,
+                        'duration_minutes': (t_end - t_start) / 60
+                    }
+
+                    import json
+                    with open(os.path.join(scene_dir, "metadata.json"), 'w') as f:
+                        json.dump(metadata, f, indent=2)
+
+                    if scene_mindist == 9999.0:
+                        solo_scenes_count += 1
+                    else:
+                        scenes_generated_count += 1
 
     except Exception as e:
         print(f"  处理文件 {os.path.basename(filepath)} 时出错: {e}")
         pass
 
-    return scenes_generated_count
+    return scenes_generated_count + solo_scenes_count  # V9: 返回总场景数
 
 
 # ==================== 主处理函数 (并行版) ====================
 
 def process_adsb_data(config):
     """
-    主处理函数 (V7 - 并行场景生成器)
+    主处理函数 (V9 - 完整场景生成器)
     """
-    print("=== ADS-B 场景数据提取 - V7-Social (240点) ===")
+    print("=== ADS-B 场景数据提取 - V9-Complete (240点) ===")
     print(f"最小轨迹长度: {config.MIN_TRACK_POINTS} 点 ({config.MIN_TRACK_POINTS * config.SEC_PER_POINT / 60:.0f} 分钟)")
     print(f"滑动窗口步长: {config.SLIDING_WINDOW_STRIDE_POINTS} 点 ({config.SLIDING_WINDOW_STRIDE_POINTS * config.SEC_PER_POINT} 秒)")
     print(f"处理文件数: {config.MAX_FILES}")
+    print("【V9特性】: 保留所有场景（包括独自飞行），计算并保存mindist元数据")
 
     # --- 1. 创建输出目录结构 ---
     # 我们只需要一个总的 'scenes' 目录
@@ -240,13 +302,38 @@ def process_adsb_data(config):
             total_scenes += scenes_count
 
     # --- 5. 打印最终报告 ---
-    print("\n\n--- ✅ 全部处理完毕 (V7-Social) ---")
+    print("\n\n--- ✅ 全部处理完毕 (V9-Complete) ---")
     print(f"数据已保存到: {scenes_output_dir}")
     print("\n=== 最终数据集统计 ===")
     print(f"总计生成场景数: {total_scenes:,} 个")
-    print("每个场景包含一个 'ego.csv' (240点) 和一个 'neighbors.csv' (N*240点)")
-    print(f"\n🎯 V7-Social 场景数据生成完毕！")
-    print(f"💡 提示：您的 Social-PatchTST 模型现在可以读取这些场景目录进行训练了。")
+
+    # 统计交互场景和独自飞行场景
+    import json
+    interaction_count = 0
+    solo_count = 0
+
+    try:
+        scene_dirs = [os.path.join(scenes_output_dir, d) for d in os.listdir(scenes_output_dir)]
+        scene_dirs = [d for d in scene_dirs if os.path.isdir(d)]
+
+        for scene_dir in scene_dirs:
+            metadata_path = os.path.join(scene_dir, 'metadata.json')
+            if os.path.exists(metadata_path):
+                with open(metadata_path, 'r') as f:
+                    metadata = json.load(f)
+                    if metadata.get('has_interaction', False):
+                        interaction_count += 1
+                    else:
+                        solo_count += 1
+    except:
+        pass
+
+    print(f"交互场景（有邻居）: {interaction_count:,} 个")
+    print(f"独自飞行场景（无邻居）: {solo_count:,} 个")
+    print(f"交互场景占比: {interaction_count/total_scenes*100:.1f}%")
+
+    print(f"\n🎯 V9-Complete 场景数据生成完毕！")
+    print(f"💡 提示：数据集包含完整的飞行模式，为分层采样做好准备")
 
 
 # ==================== 命令行接口 ====================
