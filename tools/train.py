@@ -201,7 +201,7 @@ class Trainer:
                     output['predictions'], batch['targets'], batch['distance_matrix']
                 )
 
-            # V9: 应用样本权重
+            # 应用样本权重
             if 'sample_weight' in batch:
                 sample_weights = batch['sample_weight'].to(self.device)
                 # 对每个损失项应用样本权重

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-V9 场景分层采样脚本
+场景分层采样脚本
 从完整的场景数据集中科学采样，确保数据多样性
 """
 
@@ -206,7 +206,7 @@ def analyze_sampling_quality(sampled_dir: str):
 
 def main():
     """主函数"""
-    parser = argparse.ArgumentParser(description='V9场景分层采样脚本')
+    parser = argparse.ArgumentParser(description='场景分层采样脚本')
     parser.add_argument('--scenes-dir', type=str,
                        default='/mnt/d/model/adsb_scenes/scenes',
                        help='原始场景数据目录')
@@ -236,7 +236,7 @@ def main():
         print(f"错误：场景目录不存在: {args.scenes_dir}")
         return
 
-    print("=== V9 场景分层采样 ===")
+    print("=== 场景分层采样 ===")
     print(f"输入目录: {args.scenes_dir}")
     print(f"输出目录: {args.output_dir}")
     print(f"目标场景数: {args.total_target:,}")
@@ -274,7 +274,7 @@ def main():
     # 分析采样质量
     mindist_stats, neighbor_stats = analyze_sampling_quality(output_path)
 
-    print("\n🎯 V9 分层采样完成！")
+    print("\n🎯 分层采样完成！")
     print("现在可以使用这个高质量的数据集进行训练，确保模型既能预测正常轨迹，又能处理紧急避让。")
 
 

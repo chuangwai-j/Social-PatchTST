@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-V9 分层评估器
+分层评估器
 支持按场景类别分层评估模型性能
 """
 
@@ -22,7 +22,7 @@ from data.dataset.scene_dataset import SceneDataset, create_data_loaders
 
 class StratifiedEvaluator:
     """
-    V9 分层评估器
+    分层评估器
     支持按场景类别、距离区间等维度进行分层评估
     """
 
@@ -303,7 +303,7 @@ class StratifiedEvaluator:
         report_path = os.path.join(save_path, 'evaluation_report.md')
 
         with open(report_path, 'w') as f:
-            f.write("# V9 分层评估报告\n\n")
+            f.write("# 分层评估报告\n\n")
 
             # 总体性能
             f.write("## 总体性能\n\n")
@@ -347,7 +347,7 @@ def main():
     """主函数"""
     import argparse
 
-    parser = argparse.ArgumentParser(description='V9分层评估')
+    parser = argparse.ArgumentParser(description='分层评估')
     parser.add_argument('--config', type=str,
                        default='config/social_patchtst_config.yaml',
                        help='配置文件路径')

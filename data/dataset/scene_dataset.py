@@ -1,5 +1,5 @@
 """
-V7-Social 场景数据集加载器
+Social 场景数据集加载器
 适配新的场景数据结构 (ego.csv + neighbors.csv)
 """
 
@@ -170,9 +170,9 @@ class SceneDataset(Dataset):
 
         return distance_matrix
 
-    def _calculate_v9_sample_weights(self, metadata: dict, n_neighbors: int, distance_matrix: np.ndarray) -> Tuple[str, float]:
+    def _calculate_sample_weights(self, metadata: dict, n_neighbors: int, distance_matrix: np.ndarray) -> Tuple[str, float]:
         """
-        V9课程学习样本权重计算
+        课程学习样本权重计算
 
         Args:
             metadata: 场景元数据
@@ -190,7 +190,7 @@ class SceneDataset(Dataset):
             'high_risk': 1.5
         })
 
-        # 如果有V9 metadata，优先使用
+        # 如果有metadata，优先使用
         if metadata:
             mindist = metadata.get('mindist_nm', 9999.0)
             if mindist == 9999.0:
@@ -243,7 +243,7 @@ class SceneDataset(Dataset):
                 - targets: (max_aircrafts, future_length, n_target_features)
                 - distance_matrix: (max_aircrafts, max_aircrafts)
                 - mask: (max_aircrafts,) 标记哪些位置是有效数据
-                - sample_weight: (1,) 样本权重 (V9课程学习)
+                - sample_weight: (1,) 样本权重 (课程学习)
                 - scene_category: str 场景类别 (solo/low_risk/high_risk)
         """
         scene_path = self.scene_dirs[idx]
@@ -252,7 +252,7 @@ class SceneDataset(Dataset):
         ego_df = pd.read_csv(os.path.join(scene_path, "ego.csv"))
         neighbors_df = pd.read_csv(os.path.join(scene_path, "neighbors.csv"))
 
-        # 读取V9 metadata (如果存在)
+        # 读取 metadata (如果存在)
         metadata = {}
         metadata_path = os.path.join(scene_path, "metadata.json")
         if os.path.exists(metadata_path):
@@ -342,8 +342,8 @@ class SceneDataset(Dataset):
         actual_size = distance_matrix.shape[0]
         full_distance_matrix[:actual_size, :actual_size] = torch.FloatTensor(distance_matrix)
 
-        # V9: 计算样本权重和场景分类
-        scene_category, sample_weight = self._calculate_v9_sample_weights(
+        # 计算样本权重和场景分类
+        scene_category, sample_weight = self._calculate_sample_weights(
             metadata, len(neighbor_data), distance_matrix
         )
 
@@ -416,12 +416,12 @@ def create_data_loaders(config_path: str, scenes_dir: str, batch_size: int = 8,
 
 
 if __name__ == "__main__":
-    # 测试V7数据集加载器
+    # 测试数据集加载器
     config_path = "../../config/social_patchtst_config.yaml"
-    scenes_dir = "/mnt/d/model/adsb_scenes_v7/scenes"
+    scenes_dir = "/mnt/d/model/adsb_scenes/scenes"
 
     try:
-        dataset = V7SocialDataset(scenes_dir, config_path)
+        dataset = SceneDataset(scenes_dir, config_path)
         print(f"数据集大小: {len(dataset)}")
 
         # 测试一个样本

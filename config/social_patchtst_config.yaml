@@ -107,7 +107,7 @@ training:
     altitude: 1.0            # 高度损失权重
     mindist: 2.0             # 最小距离损失权重
 
-  # V9 课程学习样本权重
+  # 课程学习样本权重
   sample_weights:
     # 根据mindist区间定义样本权重
     solo: 1.0               # 独自飞行场景 (mindist = 9999)
