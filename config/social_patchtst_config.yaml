@@ -2,9 +2,8 @@
 
 # 数据配置
 data:
-  # 数据路径
-  data_dir: "/mnt/d/model/adsb_scenes"  # 场景数据目录
-  scenes_dir: "/mnt/d/model/adsb_scenes/scenes"  # 场景文件目录
+  # 数据路径 - 场景数据目录，包含train_paths.txt, val_paths.txt, test_paths.txt
+  scenes_dir: "/mnt/f/adsb/scenes_picked"
 
   # 时间序列参数
   history_length: 120        # 历史序列长度 (10分钟 * 12点/分钟)

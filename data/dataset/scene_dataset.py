@@ -1,439 +1,372 @@
 """
-Social 场景数据集加载器
-适配新的场景数据结构 (ego.csv + neighbors.csv)
+Social-PatchTST 场景数据集加载器
+支持从CSV文件加载分层采样的场景数据，可直接用于模型训练
 """
 
 import pandas as pd
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
-from sklearn.preprocessing import StandardScaler, LabelEncoder
-from typing import Dict, List, Tuple, Optional
+from sklearn.preprocessing import StandardScaler
+from typing import Tuple
 import os
-import glob
-import json
+from pathlib import Path
 import warnings
+import sys
+
+# 添加项目根目录到Python路径
+sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from config.config_manager import load_config
 
 warnings.filterwarnings('ignore')
 
+# 实际CSV中的列名定义
+CSV_FEATURE_COLUMNS = {
+    'temporal_features': [
+        'latitude', 'longitude',      # 局部 ENU (m)
+        'flight_level',              # 气压高度(米)
+        'ground_speed', 'track_angle'  # 将用于计算 vx, vy (m/s)
+    ],
+    'spatial_features': ['latitude', 'longitude'],
+    'target_features': ['latitude', 'longitude'],
+    'static_features': ['aircraft_type', 'callsign', 'target_address']
+}
 
-class SceneDataset(Dataset):
-    """场景数据集"""
 
-    def __init__(self, scenes_data, config_path: str, max_neighbors: int = 50):
+class SocialPatchTSTDataset(Dataset):
+    """
+    Social-PatchTST 场景数据集
+    直接从train/val/test文件夹中按顺序读取场景数据
+    """
+
+    def __init__(self, data_dir: str, max_neighbors: int = 20, sequence_length: int = 600, paths_file: str = None):
         """
-        初始化场景数据集
+        从数据目录初始化场景数据集
 
         Args:
-            scenes_data: 可以是场景目录路径或场景路径列表
-            config_path: 配置文件路径
-            max_neighbors: 每个场景最大邻居数量
+            data_dir: 数据根目录路径
+            max_neighbors: 最大邻居数量
+            sequence_length: 序列长度
+            paths_file: 路径文件txt (train_paths.txt, val_paths.txt, test_paths.txt)
         """
-        self.config = load_config(config_path)
-        self.data_config = self.config.data_config
+        self.data_dir = Path(data_dir)
         self.max_neighbors = max_neighbors
+        self.sequence_length = sequence_length
 
         # 获取特征列定义
-        self.temporal_features = self.data_config['feature_cols']['temporal_features']
-        self.spatial_features = self.data_config['feature_cols']['spatial_features']
-        self.static_features = self.data_config['feature_cols']['static_features']
-        self.target_features = self.data_config['feature_cols']['target_features']
+        self.temporal_features = CSV_FEATURE_COLUMNS['temporal_features']
+        self.spatial_features = CSV_FEATURE_COLUMNS['spatial_features']
+        self.target_features = CSV_FEATURE_COLUMNS['target_features']
 
-        # 处理输入参数
-        if isinstance(scenes_data, str):
-            # 如果是字符串，假设是目录路径
-            scenes_dir = scenes_data
-            self.scene_dirs = []
-            for scene_id in os.listdir(scenes_dir):
-                scene_path = os.path.join(scenes_dir, scene_id)
-                if os.path.isdir(scene_path):
-                    ego_path = os.path.join(scene_path, "ego.csv")
-                    neighbors_path = os.path.join(scene_path, "neighbors.csv")
-                    if os.path.exists(ego_path) and os.path.exists(neighbors_path):
-                        self.scene_dirs.append(scene_path)
+        print(f"📂 从路径文件加载场景: {paths_file}")
+        # 从txt文件读取场景路径
+        self.scenes = []
+        if paths_file and os.path.exists(paths_file):
+            with open(paths_file, 'r') as f:
+                for line in f:
+                    scene_path = line.strip()
+                    if scene_path:
+                        scene_name = os.path.basename(scene_path)
+                        ego_path = os.path.join(scene_path, "ego.csv")
+                        neighbor_path = os.path.join(scene_path, "neighbors.csv")
+
+                        if os.path.exists(ego_path) and os.path.exists(neighbor_path):
+                            self.scenes.append({
+                                'scene_id': scene_name,
+                                'ego_path': ego_path,
+                                'neighbor_path': neighbor_path,
+                                'layer': self._extract_layer_from_name(scene_name)
+                            })
+        print(f"✅ 发现 {len(self.scenes)} 个有效场景")
+
+        # 快速验证数据完整性
+        print("🔍 验证数据完整性...")
+        self._verify_data_integrity()
+
+        # 初始化标准化器
+        self._initialize_scalers()
+
+    def _extract_layer_from_name(self, scene_name: str) -> str:
+        """从场景名称中提取层级信息"""
+        # 这里可以根据你的命名规则来提取层级
+        # 暂时返回默认值
+        return "default"
+
+    def _verify_data_integrity(self):
+        """验证数据完整性"""
+        # 抽样验证前100个场景
+        sample_size = min(100, len(self.scenes))
+        valid_count = 0
+
+        for idx in range(sample_size):
+            scene = self.scenes[idx]
+            ego_path = scene['ego_path']
+            neighbor_path = scene['neighbor_path']
+
+            if os.path.exists(ego_path) and os.path.exists(neighbor_path):
+                valid_count += 1
+
+        validity_rate = valid_count / sample_size
+        if validity_rate >= 0.9:
+            print(f"✅ 数据完整性良好 ({validity_rate:.1%})，使用全部场景")
+            self.valid_scenes = self.scenes
         else:
-            # 如果是列表，假设是场景路径列表
-            self.scene_dirs = scenes_data
+            print(f"⚠️  数据完整性较低 ({validity_rate:.1%})，建议检查数据")
+            self.valid_scenes = self.scenes  # 仍使用全部数据
 
-        print(f"���到 {len(self.scene_dirs)} 个有效场景")
+        print(f"最终使用场景数量: {len(self.valid_scenes)}")
 
-        # 初始化归一化器和编码器（需要在第一个场景上拟合）
-        self.scalers = {}
-        self.encoders = {}
-        self.is_fitted = False
+    def _initialize_scalers(self):
+        """初始化数据标准化器"""
+        print("🔧 初始化数据标准化器...")
 
-        # 拟合预处理器
-        self._fit_processors()
+        sample_size = min(50, len(self.valid_scenes))
+        all_features = []
 
-    def _fit_processors(self):
-        """在第一个场景上拟合预处理器"""
-        if not self.scene_dirs:
-            raise ValueError("没有找到有效的场景数据")
+        for i in range(sample_size):
+            try:
+                scene = self.valid_scenes[i]
 
-        print("拟合数据预处理器...")
+                # 加载ego数据并处理特征
+                ego_df = pd.read_csv(scene['ego_path'])
+                ego_features = self._process_features(ego_df)
+                all_features.append(ego_features)
 
-        # 使用第一个场景的数据进行拟合
-        first_scene = self.scene_dirs[0]
-        ego_df = pd.read_csv(os.path.join(first_scene, "ego.csv"))
-        neighbors_df = pd.read_csv(os.path.join(first_scene, "neighbors.csv"))
+                # 加载邻居数据样本并处理特征
+                neighbors_df = pd.read_csv(scene['neighbor_path'])
+                # 处理前几个邻居来收集特征
+                neighbor_groups = neighbors_df.groupby('target_address')
+                for aircraft_id, neighbor_group in list(neighbor_groups)[:3]:  # 限制为前3个邻居
+                    neighbor_features = self._process_features(neighbor_group)
+                    all_features.append(neighbor_features)
 
-        # 合并所有数据用于拟合
-        all_data = pd.concat([ego_df, neighbors_df], ignore_index=True)
+            except Exception as e:
+                continue
 
-        # 为数值特征拟合StandardScaler
-        numeric_features = self.temporal_features + self.spatial_features
-        for feature in numeric_features:
-            if feature in all_data.columns:
-                self.scalers[feature] = StandardScaler()
-                values = all_data[feature].values.reshape(-1, 1)
-                self.scalers[feature].fit(values)
-                print(f"  - {feature}: mean={self.scalers[feature].mean_[0]:.3f}, std={self.scalers[feature].scale_[0]:.3f}")
-
-        # 为分类特征拟合LabelEncoder
-        categorical_features = ['aircraft_type']
-        for feature in categorical_features:
-            if feature in all_data.columns:
-                self.encoders[feature] = LabelEncoder()
-                values = all_data[feature].astype(str).values
-                self.encoders[feature].fit(values)
-                print(f"  - {feature}: {len(self.encoders[feature].classes_)} 个类别")
-
-        self.is_fitted = True
-        print("数据预处理器拟合完成!")
-
-    def _transform_data(self, df: pd.DataFrame) -> pd.DataFrame:
-        """转换数据（归一化和编码）"""
-        if not self.is_fitted:
-            raise ValueError("预处理器未拟合")
-
-        df_transformed = df.copy()
-
-        # 数值特征归一化
-        numeric_features = self.temporal_features + self.spatial_features
-        for feature in numeric_features:
-            if feature in df_transformed.columns and feature in self.scalers:
-                values = df_transformed[feature].values.reshape(-1, 1)
-                df_transformed[feature] = self.scalers[feature].transform(values).flatten()
-
-        # 分类特征编码
-        for feature in ['aircraft_type']:
-            if feature in df_transformed.columns and feature in self.encoders:
-                values = df_transformed[feature].astype(str).values
-                # 处理未见过的类别
-                mask = ~np.isin(values, self.encoders[feature].classes_)
-                if mask.any():
-                    values[mask] = self.encoders[feature].classes_[0]
-                df_transformed[feature] = self.encoders[feature].transform(values)
-
-        return df_transformed
-
-    def _calculate_distance_matrix(self, ego_positions: np.ndarray, neighbor_positions: np.ndarray) -> np.ndarray:
-        """
-        计算距离矩阵
-
-        Args:
-            ego_positions: Ego飞机的位置 (240, 2) -> [lat, lon]
-            neighbor_positions: 邻居飞机的位置 (N, 240, 2)
-
-        Returns:
-            distance_matrix: (N+1, N+1) 的距离矩阵
-        """
-        history_length = self.data_config['history_length']
-
-        # 使用历史轨迹的最后一个位置计算距离
-        ego_last_pos = ego_positions[history_length-1]  # (2,)
-        neighbor_last_positions = neighbor_positions[:, history_length-1, :]  # (N, 2)
-
-        # 初始化距离矩阵 (ego + neighbors)
-        n_neighbors = len(neighbor_last_positions)
-        distance_matrix = np.zeros((n_neighbors + 1, n_neighbors + 1))
-
-        # 计算邻居到ego的距离
-        for i in range(n_neighbors):
-            dist = self._haversine_distance(
-                ego_last_pos[0], ego_last_pos[1],
-                neighbor_last_positions[i, 0], neighbor_last_positions[i, 1]
-            )
-            distance_matrix[0, i+1] = dist
-            distance_matrix[i+1, 0] = dist
-
-        # 计算邻居之间的距离
-        for i in range(n_neighbors):
-            for j in range(n_neighbors):
-                if i != j:
-                    dist = self._haversine_distance(
-                        neighbor_last_positions[i, 0], neighbor_last_positions[i, 1],
-                        neighbor_last_positions[j, 0], neighbor_last_positions[j, 1]
-                    )
-                    distance_matrix[i+1, j+1] = dist
-
-        return distance_matrix
-
-    def _calculate_sample_weights(self, metadata: dict, n_neighbors: int, distance_matrix: np.ndarray) -> Tuple[str, float]:
-        """
-        课程学习样本权重计算
-
-        Args:
-            metadata: 场景元数据
-            n_neighbors: 邻居数量
-            distance_matrix: 距离矩阵
-
-        Returns:
-            tuple: (场景类别, 样本权重)
-        """
-        # 获取配置
-        sample_weights_config = self.config.get('training.sample_weights', {})
-        loss_scaling = sample_weights_config.get('loss_scaling', {
-            'solo': 0.8,
-            'low_risk': 1.2,
-            'high_risk': 1.5
-        })
-
-        # 如果有metadata，优先使用
-        if metadata:
-            mindist = metadata.get('mindist_nm', 9999.0)
-            if mindist == 9999.0:
-                return 'solo', loss_scaling.get('solo', 0.8)
-            elif mindist < 30.0:
-                return 'high_risk', loss_scaling.get('high_risk', 1.5)
-            else:
-                return 'low_risk', loss_scaling.get('low_risk', 1.2)
-
-        # 后备方案：根据邻居数量和距离矩阵计算
-        if n_neighbors == 0:
-            return 'solo', loss_scaling.get('solo', 0.8)
-
-        # 计算最小距离（排除ego到自己的距离）
-        min_dist = distance_matrix[0, 1:].min() if distance_matrix.shape[0] > 1 else 9999.0
-
-        if min_dist < 30.0:
-            return 'high_risk', loss_scaling.get('high_risk', 1.5)
+        if all_features:
+            all_features = np.vstack(all_features)
+            self.feature_scaler = StandardScaler()
+            self.feature_scaler.fit(all_features)
+            print(f"✅ 标准化器已拟合，特征维度: {all_features.shape}")
         else:
-            return 'low_risk', loss_scaling.get('low_risk', 1.2)
+            self.feature_scaler = None
+            print("⚠️  无法拟合标准化器，将使用原始数据")
 
-    def _haversine_distance(self, lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-        """计算两点间的大圆距离（海里）"""
-        # 转换为弧度
-        lat1, lon1, lat2, lon2 = map(np.radians, [lat1, lon1, lat2, lon2])
+    def _process_features(self, df):
+        """
+        处理特征：提取基本特征并计算速度向量
+        Args:
+            df: 原始DataFrame
+        Returns:
+            processed_features: 处理后的特征数组 [seq_len, 5]
+        """
+        # 提取基本特征
+        lat = df['latitude'].values
+        lon = df['longitude'].values
+        flight_level = df['flight_level'].values
+        ground_speed = df['ground_speed'].values
+        track_angle = df['track_angle'].values
 
-        # 使用Haversine公式
-        dlat = lat2 - lat1
-        dlon = lon2 - lon1
+        # 转换速度向量 (m/s)
+        # 注意：track_angle 单位是度，需要转换为弧度
+        track_rad = np.deg2rad(track_angle)
+        vx = ground_speed * np.sin(track_rad)  # 东向速度
+        vy = ground_speed * np.cos(track_rad)  # 北向速度
 
-        a = np.sin(dlat/2)**2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon/2)**2
-        c = 2 * np.arcsin(np.sqrt(a))
+        # 组合特征 [lat, lon, flight_level, vx, vy]
+        processed_features = np.column_stack([
+            lat, lon, flight_level, vx, vy
+        ])
 
-        # 地球半径（海里）
-        earth_radius_nm = 3440.065
+        return processed_features
 
-        return c * earth_radius_nm
+    def _load_single_scene(self, idx):
+        """加载单个场景的数据"""
+        scene = self.valid_scenes[idx]
+        scene_id = scene['scene_id']
+
+        try:
+            # 加载ego数据
+            ego_df = pd.read_csv(scene['ego_path'])
+            ego_features = self._process_features(ego_df)  # [seq_len, 5]
+
+            # 加载neighbor数据
+            neighbors_df = pd.read_csv(scene['neighbor_path'])
+
+            # 选择最多max_neighbors个邻居（保持顺序）
+            if len(neighbors_df) > self.max_neighbors:
+                neighbors_df = neighbors_df.head(self.max_neighbors)
+
+            neighbor_features_list = []
+            # 按飞机ID分组处理邻居数据
+            for aircraft_id, neighbor_group in neighbors_df.groupby('target_address'):
+                neighbor_features = self._process_features(neighbor_group)
+                neighbor_features_list.append(neighbor_features)
+
+            return {
+                'scene_id': scene_id,
+                'ego_features': ego_features,
+                'neighbor_features': neighbor_features_list,
+                'layer': scene['layer']
+            }
+
+        except Exception as e:
+            print(f"⚠️  加载场景 {scene_id} 失败: {e}")
+            return None
 
     def __len__(self):
-        return len(self.scene_dirs)
+        return len(self.valid_scenes)
 
     def __getitem__(self, idx):
-        """
-        获取单个场景的数据
+        """获取单个数据样本"""
+        scene_data = self._load_single_scene(idx)
 
-        Returns:
-            dict: 包含以下键:
-                - temporal: (max_aircrafts, history_length, n_temporal_features)
-                - spatial: (max_aircrafts, history_length, n_spatial_features)
-                - targets: (max_aircrafts, future_length, n_target_features)
-                - distance_matrix: (max_aircrafts, max_aircrafts)
-                - mask: (max_aircrafts,) 标记哪些位置是有效数据
-                - sample_weight: (1,) 样本权重 (课程学习)
-                - scene_category: str 场景类别 (solo/low_risk/high_risk)
-        """
-        scene_path = self.scene_dirs[idx]
+        if scene_data is None:
+            # 返回空样本
+            return {
+                'scene_id': f"empty_{idx}",
+                'ego_features': torch.zeros(self.sequence_length, 5),  # 5维特征
+                'neighbor_features': torch.zeros(self.max_neighbors, self.sequence_length, 5),  # 5维特征
+                'target': torch.zeros(2),  # [lat, lon]
+                'layer': 'Unknown'
+            }
 
-        # 读取数据
-        ego_df = pd.read_csv(os.path.join(scene_path, "ego.csv"))
-        neighbors_df = pd.read_csv(os.path.join(scene_path, "neighbors.csv"))
+        # 处理ego特征
+        ego_features = scene_data['ego_features']
+        if self.feature_scaler is not None:
+            ego_features = self.feature_scaler.transform(ego_features)
 
-        # 读取 metadata (如果存在)
-        metadata = {}
-        metadata_path = os.path.join(scene_path, "metadata.json")
-        if os.path.exists(metadata_path):
-            with open(metadata_path, 'r') as f:
-                metadata = json.load(f)
+        # 确保序列长度一致
+        if len(ego_features) > self.sequence_length:
+            ego_features = ego_features[:self.sequence_length]
+        elif len(ego_features) < self.sequence_length:
+            # 填充
+            padding = np.zeros((self.sequence_length - len(ego_features), ego_features.shape[1]))
+            ego_features = np.vstack([ego_features, padding])
 
-        # 数据预处理
-        ego_df = self._transform_data(ego_df)
-        neighbors_df = self._transform_data(neighbors_df)
+        # 处理邻居特征
+        neighbor_features = scene_data['neighbor_features']
+        neighbor_tensor = torch.zeros(self.max_neighbors, self.sequence_length, len(self.temporal_features))
 
-        # 提取时间维度参数
-        history_length = self.data_config['history_length']
-        future_length = self.data_config['prediction_length']
-        total_length = history_length + future_length
+        for i, neigh_feat in enumerate(neighbor_features[:self.max_neighbors]):
+            if neigh_feat.ndim == 1:
+                neigh_feat = neigh_feat.reshape(1, -1)
 
-        # 提取ego数据
-        ego_temporal = ego_df[self.temporal_features].values  # (240, n_temporal)
-        ego_spatial = ego_df[self.spatial_features].values    # (240, n_spatial)
-        ego_targets = ego_df[self.target_features].values    # (240, n_target)
+            if self.feature_scaler is not None:
+                neigh_feat = self.feature_scaler.transform(neigh_feat)
 
-        # 分离历史和未来
-        ego_temporal_history = ego_temporal[:history_length]
-        ego_spatial_history = ego_spatial[:history_length]
-        ego_targets_future = ego_targets[history_length:]
+            if len(neigh_feat) > self.sequence_length:
+                neigh_feat = neigh_feat[:self.sequence_length]
+            elif len(neigh_feat) < self.sequence_length:
+                padding = np.zeros((self.sequence_length - len(neigh_feat), neigh_feat.shape[1]))
+                neigh_feat = np.vstack([neigh_feat, padding])
 
-        # 提取邻居数据
-        neighbor_data = []
-        for neighbor_id, neighbor_group in neighbors_df.groupby('target_address'):
-            if len(neighbor_group) == total_length:  # 确保是完整的240点轨迹
-                neighbor_temporal = neighbor_group[self.temporal_features].values
-                neighbor_spatial = neighbor_group[self.spatial_features].values
-                neighbor_targets = neighbor_group[self.target_features].values
+            neighbor_tensor[i] = torch.from_numpy(neigh_feat).float()
 
-                neighbor_temporal_history = neighbor_temporal[:history_length]
-                neighbor_spatial_history = neighbor_spatial[:history_length]
-                neighbor_targets_future = neighbor_targets[history_length:]
-
-                neighbor_data.append({
-                    'temporal': neighbor_temporal_history,
-                    'spatial': neighbor_spatial_history,
-                    'targets': neighbor_targets_future
-                })
-
-        # 限制邻居数量
-        if len(neighbor_data) > self.max_neighbors:
-            # 随机选择max_neighbors个邻居
-            indices = np.random.choice(len(neighbor_data), self.max_neighbors, replace=False)
-            neighbor_data = [neighbor_data[i] for i in indices]
-
-        # 构建批次数据
-        n_aircrafts = len(neighbor_data) + 1  # +1 for ego
-
-        # 始终使用固定的max_aircrafts，确保batch内tensor形状一致
-        max_aircrafts = self.max_neighbors + 1
-
-        # 初始化张量
-        n_temporal = len(self.temporal_features)
-        n_spatial = len(self.spatial_features)
-        n_target = len(self.target_features)
-
-        temporal_tensor = torch.zeros(max_aircrafts, history_length, n_temporal)
-        spatial_tensor = torch.zeros(max_aircrafts, history_length, n_spatial)
-        targets_tensor = torch.zeros(max_aircrafts, future_length, n_target)
-        mask = torch.zeros(max_aircrafts, dtype=torch.bool)
-
-        # 填充ego数据（第一个位置）
-        temporal_tensor[0] = torch.FloatTensor(ego_temporal_history)
-        spatial_tensor[0] = torch.FloatTensor(ego_spatial_history)
-        targets_tensor[0] = torch.FloatTensor(ego_targets_future)
-        mask[0] = True
-
-        # 填充邻居数据
-        for i, neighbor in enumerate(neighbor_data[:self.max_neighbors]):
-            temporal_tensor[i+1] = torch.FloatTensor(neighbor['temporal'])
-            spatial_tensor[i+1] = torch.FloatTensor(neighbor['spatial'])
-            targets_tensor[i+1] = torch.FloatTensor(neighbor['targets'])
-            mask[i+1] = True
-
-        # 计算距离矩阵
-        distance_matrix = self._calculate_distance_matrix(
-            ego_spatial_history,
-            spatial_tensor[1:][mask[1:]].numpy()
-        )
-
-        # 填充到max_aircrafts大小
-        full_distance_matrix = torch.zeros(max_aircrafts, max_aircrafts)
-        actual_size = distance_matrix.shape[0]
-        full_distance_matrix[:actual_size, :actual_size] = torch.FloatTensor(distance_matrix)
-
-        # 计算样本权重和场景分类
-        scene_category, sample_weight = self._calculate_sample_weights(
-            metadata, len(neighbor_data), distance_matrix
-        )
+        # 创建目标（使用最后一个时间步的位置作为预测目标）
+        # 新的特征顺序: [latitude(0), longitude(1), flight_level(2), vx(3), vy(4)]
+        target_data = ego_features[-1, [0, 1]]  # [lat, lon]
 
         return {
-            'temporal': temporal_tensor,
-            'spatial': spatial_tensor,
-            'targets': targets_tensor,
-            'distance_matrix': full_distance_matrix,
-            'mask': mask,
-            'scene_id': os.path.basename(scene_path),
-            'sample_weight': torch.FloatTensor([sample_weight]),
-            'scene_category': scene_category,
-            'mindist': metadata.get('mindist_nm', distance_matrix[0, 1:].min() if len(neighbor_data) > 0 else 9999.0)
+            'scene_id': scene_data['scene_id'],
+            'ego_features': torch.from_numpy(ego_features).float(),
+            'neighbor_features': neighbor_tensor,
+            'target': torch.from_numpy(target_data).float(),
+            'layer': scene_data['layer']
         }
 
 
-def create_data_loaders(config_path: str, scenes_dir: str, batch_size: int = 8,
-                          max_neighbors: int = 50, num_workers: int = 4) -> Tuple[DataLoader, DataLoader, DataLoader]:
+def create_social_patchtst_loaders(config_path: str = None, batch_size: int = 32,
+                                  max_neighbors: int = 20, sequence_length: int = 600,
+                                  num_workers: int = 4) -> Tuple[DataLoader, DataLoader, DataLoader]:
     """
-    创建场景数据加载器
+    创建Social-PatchTST数据加载器
 
     Args:
-        config_path: 配置文件路径
-        scenes_dir: 场景根目录
+        config_path: 配置文件路径，如果为None则使用默认配置
         batch_size: 批大小
         max_neighbors: 每个场景最大邻居数量
+        sequence_length: 序列长度
         num_workers: 数据加载器工作进程数
 
     Returns:
-        训练、验证和测试数据加载器
+        train_loader, val_loader, test_loader
     """
-    # 假设数据已经按8:1:1分割
-    all_scenes = [os.path.join(scenes_dir, d) for d in os.listdir(scenes_dir)
-                  if os.path.isdir(os.path.join(scenes_dir, d))]
+    # 加载配置文件
+    if config_path is None:
+        config_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+                                 "config", "social_patchtst_config.yaml")
 
-    np.random.shuffle(all_scenes)
-    n_total = len(all_scenes)
+    config = load_config(config_path)
 
-    train_end = int(0.8 * n_total)
-    val_end = int(0.9 * n_total)
+    # 从配置文件获取数据目录
+    scenes_dir = config.get('data.scenes_dir') or config.get('data.data_dir')
+    if not scenes_dir:
+        raise ValueError("配置文件中未找到 data.scenes_dir 或 data.data_dir")
 
-    train_scenes = all_scenes[:train_end]
-    val_scenes = all_scenes[train_end:val_end]
-    test_scenes = all_scenes[val_end:]
+    scenes_path = Path(scenes_dir)
 
-    print(f"训练场景: {len(train_scenes)}")
-    print(f"验证场景: {len(val_scenes)}")
-    print(f"测试场景: {len(test_scenes)}")
+    # 路径文件路径
+    train_paths_file = scenes_path / "train_paths.txt"
+    val_paths_file = scenes_path / "val_paths.txt"
+    test_paths_file = scenes_path / "test_paths.txt"
+
+    print("🚀 创建Social-PatchTST数据加载器")
+    print(f"   配置文件: {config_path}")
+    print(f"   数据目录: {scenes_path}")
+    print(f"   训练路径: {train_paths_file}")
+    print(f"   验证路径: {val_paths_file}")
+    print(f"   测试路径: {test_paths_file}")
+
+    # 检查路径文件是否存在
+    if not train_paths_file.exists():
+        raise FileNotFoundError(f"训练路径文件不存在: {train_paths_file}")
+    if not val_paths_file.exists():
+        raise FileNotFoundError(f"验证路径文件不存在: {val_paths_file}")
+    if not test_paths_file.exists():
+        raise FileNotFoundError(f"测试路径文件不存在: {test_paths_file}")
 
     # 创建数据集
-    train_dataset = SceneDataset(train_scenes, config_path, max_neighbors)
-    val_dataset = SceneDataset(val_scenes, config_path, max_neighbors)
-    test_dataset = SceneDataset(test_scenes, config_path, max_neighbors)
+    train_dataset = SocialPatchTSTDataset(str(scenes_path), max_neighbors, sequence_length, str(train_paths_file))
+    val_dataset = SocialPatchTSTDataset(str(scenes_path), max_neighbors, sequence_length, str(val_paths_file))
+    test_dataset = SocialPatchTSTDataset(str(scenes_path), max_neighbors, sequence_length, str(test_paths_file))
 
     # 创建数据加载器
     train_loader = DataLoader(
-        train_dataset, batch_size=batch_size, shuffle=True,
-        num_workers=num_workers, pin_memory=True
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        drop_last=True
     )
     val_loader = DataLoader(
-        val_dataset, batch_size=batch_size, shuffle=False,
-        num_workers=num_workers, pin_memory=True
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers
     )
     test_loader = DataLoader(
-        test_dataset, batch_size=batch_size, shuffle=False,
-        num_workers=num_workers, pin_memory=True
+        test_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers
     )
+
+    print("✅ 数据加载器创建成功!")
+    print(f"   训练集: {len(train_dataset)} 样本 ({len(train_loader)} batches)")
+    print(f"   验证集: {len(val_dataset)} 样本 ({len(val_loader)} batches)")
+    print(f"   测试集: {len(test_dataset)} 样本 ({len(test_loader)} batches)")
+    print(f"   特征维度: {len(CSV_FEATURE_COLUMNS['temporal_features'])}")
 
     return train_loader, val_loader, test_loader
 
 
-if __name__ == "__main__":
-    # 测试数据集加载器
-    config_path = "../../config/social_patchtst_config.yaml"
-    scenes_dir = "/mnt/d/model/adsb_scenes/scenes"
-
-    try:
-        dataset = SceneDataset(scenes_dir, config_path)
-        print(f"数据集大小: {len(dataset)}")
-
-        # 测试一个样本
-        sample = dataset[0]
-        print(f"时序数据形状: {sample['temporal'].shape}")
-        print(f"空间数据形状: {sample['spatial'].shape}")
-        print(f"目标数据形状: {sample['targets'].shape}")
-        print(f"距离矩阵形状: {sample['distance_matrix'].shape}")
-        print(f"掩码形状: {sample['mask'].shape}")
-        print(f"场景ID: {sample['scene_id']}")
-
-    except Exception as e:
-        print(f"测试失败: {e}")
-        import traceback
-        traceback.print_exc()
+def get_feature_info():
+    """获取特征信息"""
+    return {
+        'temporal_features': CSV_FEATURE_COLUMNS['temporal_features'],
+        'spatial_features': CSV_FEATURE_COLUMNS['spatial_features'],
+        'target_features': CSV_FEATURE_COLUMNS['target_features'],
+        'n_temporal_features': len(CSV_FEATURE_COLUMNS['temporal_features']),
+        'n_target_features': len(CSV_FEATURE_COLUMNS['target_features'])
+    }
