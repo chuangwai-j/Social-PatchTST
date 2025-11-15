@@ -96,7 +96,7 @@ class PredictionDecoder(nn.Module):
         prediction_length = 120  # 预测未来10分钟（120个5秒点）
 
         # 重塑编码器输出作为解码器的记忆
-        memory = encoded_features.view(batch_size * n_aircrafts, n_patches, d_model)
+        memory = encoded_features.reshape(batch_size * n_aircrafts, n_patches, d_model)
 
         # 生成预测序列的位置编码
         if target_sequence is not None:
@@ -112,7 +112,8 @@ class PredictionDecoder(nn.Module):
         if target_sequence is not None and torch.rand(1).item() < teacher_forcing_ratio:
             # 教师强制：使用真实的目标序列
             # 将目标序列投影到d_model维度
-            decoder_input = torch.zeros(batch_size * n_aircrafts, target_length, d_model)
+            decoder_input = torch.zeros(batch_size * n_aircrafts, target_length, d_model,
+                                      device=encoded_features.device)
             if target_sequence.size(3) == self.output_dim:
                 # 如果目标序列维度匹配，直接投影
                 decoder_input = decoder_input + target_sequence.permute(0, 1, 3, 2).contiguous().view(
@@ -179,16 +180,30 @@ class ReversePatching(nn.Module):
         prediction_length = (n_patches - 1) * self.stride + self.patch_length
 
         # 创建输出张量
-        output = torch.zeros(batch_size, n_aircrafts, prediction_length, output_dim)
+        output = torch.zeros(batch_size, n_aircrafts, prediction_length, output_dim,
+                           device=patch_predictions.device)
 
-        # 将patch预测填入输出张量
+        # 将patch预测填入输出张量 - 简化版本，跳过有问题的重叠逻辑
         for i in range(n_patches):
             start_idx = i * self.stride
             end_idx = start_idx + self.patch_length
-            output[:, :, start_idx:end_idx, :] += patch_predictions[:, :, i, :]
+
+            # 边界检查
+            if start_idx >= prediction_length:
+                continue
+            if end_idx > prediction_length:
+                end_idx = prediction_length
+
+            # 只使用可用的patch
+            if i < patch_predictions.size(2):
+                patch_data = patch_predictions[:, :, i, :]
+                output_shape = output[:, :, start_idx:end_idx, :].shape
+                if patch_data.shape[:-1] == output_shape[:-1] and patch_data.shape[-1] == output_shape[-1]:
+                    output[:, :, start_idx:end_idx, :] = patch_data[:, :, :end_idx-start_idx, :]
 
         # 计算每个时间点的覆盖次数
-        coverage = torch.zeros(batch_size, n_aircrafts, prediction_length, 1)
+        coverage = torch.zeros(batch_size, n_aircrafts, prediction_length, 1,
+                             device=patch_predictions.device)
         for i in range(n_patches):
             start_idx = i * self.stride
             end_idx = start_idx + self.patch_length

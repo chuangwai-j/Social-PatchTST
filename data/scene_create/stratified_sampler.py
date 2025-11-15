@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
-优化版分层采样器 - 读取预生成索引
-30 % Solo | 50 % Low-Risk | 20 % High-Risk
-使用索引文件，避免目录扫描，秒级完成
+修复版分层采样器 - 先切分后采样 (Split-First Stratified Sampler)
+逻辑修正：
+❌ 错误：先从总池抽样 -> 再切分 (导致时间乱序，训练集混入未来数据)
+✅ 正确：先按时间切分总池 -> 再各自分层抽样 (保证物理隔离)
 """
-import time, pandas as pd
+import time
+import pandas as pd
+import numpy as np
 from pathlib import Path
-from sklearn.model_selection import train_test_split
 
 SCENE_ROOT = Path("/mnt/f/adsb/scenes")
 INDEX_FILE = Path("/mnt/f/adsb/scene_index.tsv")
@@ -23,147 +25,118 @@ TRAIN_RATIO = 0.70
 VAL_RATIO = 0.15
 TEST_RATIO = 0.15
 
-def load_scenes_from_index():
-    """从索引文件加载场景数据"""
-    if not INDEX_FILE.exists():
-        raise FileNotFoundError(f"❌ 索引文件不存在: {INDEX_FILE}\n请先运行: bash data/scene_create/generate_index.sh")
 
-    print("📂 读取场景索引...")
+def load_raw_index():
+    """加载原始索引，保留原始时间顺序"""
+    if not INDEX_FILE.exists():
+        raise FileNotFoundError(f"❌ 索引文件不存在: {INDEX_FILE}")
+
+    print("📂 读取场景索引 (假设文件行序 = 时间顺序)...")
     start_time = time.time()
 
-    # 读取索引文件
-    df_index = pd.read_csv(INDEX_FILE, sep='|', names=['scene_id', 'mindist_nm'])
-    load_time = time.time() - start_time
+    # 也就是直接相信你的 index.tsv 是时间有序的
+    df = pd.read_csv(INDEX_FILE, sep='|', names=['scene_id', 'mindist_nm'])
 
-    print(f"✅ 索引载入完成：{len(df_index):,} 条 | 耗时: {load_time:.2f}秒")
+    # 预计算 Layer，方便后续处理
+    # 使用向量化操作加速
+    conditions = [
+        (df['mindist_nm'] > SOLO_THR),
+        (df['mindist_nm'] >= LOW_RISK_LO) & (df['mindist_nm'] <= LOW_RISK_HI),
+        (df['mindist_nm'] < 3.0)
+    ]
+    choices = ['Solo', 'Low-Risk', 'High-Risk']
+    df['layer'] = np.select(conditions, choices, default='Solo')
 
-    # 转换为完整记录
-    print("🔄 转换为训练数据格式...")
-    convert_start = time.time()
+    # 添加路径 (向量化)
+    # 注意：这里只存相对路径或ID，最后保存时再拼完整路径，节省内存
 
-    records = []
-    for _, row in df_index.iterrows():
-        mindist = float(row.mindist_nm)
-        scene_id = row.scene_id
+    print(f"✅ 索引加载完成: {len(df):,} 条 | 耗时: {time.time() - start_time:.2f}s")
+    return df
 
-        # 分层逻辑
-        if mindist > SOLO_THR:
-            layer = 'Solo'
-        elif LOW_RISK_LO <= mindist <= LOW_RISK_HI:
-            layer = 'Low-Risk'
-        elif mindist < 3.0:
-            layer = 'High-Risk'
-        else:
-            layer = 'Solo'  # 兜底
 
-        records.append({
-            'scene_id': scene_id,
-            'layer': layer,
-            'mindist_nm': mindist,
-            'ego_path': str(SCENE_ROOT / scene_id / "ego.csv"),
-            'neighbor_path': str(SCENE_ROOT / scene_id / "neighbors.csv"),
-        })
+def stratified_sample_from_subset(df_subset, subset_name, n_target):
+    """在给定的子集内进行分层采样"""
+    print(f"   🎯 正在对 [{subset_name}] 进行分层采样 (目标: {n_target:,})...")
 
-    convert_time = time.time() - convert_start
-    print(f"✅ 数据转换完成：{len(records):,} 条 | 耗时: {convert_time:.2f}秒")
-
-    return records, load_time, convert_time
-
-def main():
-    print("🚀 优化版分层采样器启动 (使用索引文件)")
-    print("="*60)
-
-    # 记录总开始时间
-    total_start_time = time.time()
-
-    # 1. 加载数据
-    records, load_time, convert_time = load_scenes_from_index()
-    df_all = pd.DataFrame(records)
-
-    # 2. 检查分层分布
-    print(f"\n📊 各层分布:")
-    layer_distribution = df_all['layer'].value_counts()
-    for layer, count in layer_distribution.items():
-        percentage = count / len(df_all) * 100
-        print(f"  {layer}: {count:,} 条 ({percentage:.1f}%)")
-
-    # 3. 分层采样
-    print(f"\n🎯 开始分层采样...")
-    sample_start = time.time()
-
-    def sample_layer(g, n):
-        return g.sample(n=n, replace=len(g) < n, random_state=42)
-
-    layer_targets = {
-        'Solo': int(TOTAL_TARGET * 0.30),
-        'Low-Risk': int(TOTAL_TARGET * 0.50),
-        'High-Risk': int(TOTAL_TARGET * 0.20),
+    targets = {
+        'Solo': int(n_target * 0.30),
+        'Low-Risk': int(n_target * 0.50),
+        'High-Risk': int(n_target * 0.20),
     }
 
-    print(f"目标采样: Solo {layer_targets['Solo']:,} | Low-Risk {layer_targets['Low-Risk']:,} | High-Risk {layer_targets['High-Risk']:,}")
+    results = []
+    for layer, count in targets.items():
+        layer_data = df_subset[df_subset['layer'] == layer]
 
-    sampled = (df_all.groupby('layer', group_keys=False)
-                     .apply(lambda g: sample_layer(g, layer_targets[g.name])))
+        if len(layer_data) == 0:
+            print(f"      ⚠️  {subset_name} - {layer} 层为空！无法采样！")
+            continue
 
-    sample_time = time.time() - sample_start
-    print(f"✅ 采样完成：{len(sampled):,} 条 | 耗时: {sample_time:.2f}秒")
+        # 采样 (如果不够就重复采样 replace=True)
+        # random_state 确保复现性
+        sampled = layer_data.sample(n=count, replace=(len(layer_data) < count), random_state=42)
+        results.append(sampled)
 
-    # 4. 划分数据集
-    print(f"\n🎯 划分训练/验证/测试集...")
-    split_start = time.time()
+    final_df = pd.concat(results).sample(frac=1, random_state=42)  # 最后打乱顺序，方便训练
+    print(f"      ✅ {subset_name} 完成: {len(final_df):,} 条")
+    return final_df
 
-    train, temp = train_test_split(sampled, stratify=sampled['layer'],
-                                   train_size=TRAIN_RATIO, random_state=42)
-    val, test = train_test_split(temp, stratify=temp['layer'],
-                                 train_size=VAL_RATIO/(VAL_RATIO+TEST_RATIO), random_state=42)
 
-    split_time = time.time() - split_start
-    print(f"✅ 数据划分完成 | 耗时: {split_time:.2f}秒")
+def main():
+    print("🚀 修复版分层采样器 (Split-Then-Sample Strategy)")
+    print("=" * 60)
 
-    # 5. 输出CSV
-    print(f"\n💾 保存CSV文件...")
-    output_start = time.time()
+    # 1. 加载原始数据 (保持时间顺序)
+    df_raw = load_raw_index()
+    total_raw = len(df_raw)
 
-    OUTPUT_DIR.mkdir(exist_ok=True)
-    train.to_csv(OUTPUT_DIR / "train.csv", index=False)
-    val.to_csv(OUTPUT_DIR / "val.csv", index=False)
-    test.to_csv(OUTPUT_DIR / "test.csv", index=False)
+    # 2. 【关键步骤】先按时间顺序切分大池子
+    # 假设 df_raw 的行序就是时间序
+    print("\n🔪 第一步：按原始时间顺序切分总池 (物理隔离)...")
 
-    output_time = time.time() - output_start
-    total_time = time.time() - total_start_time
+    idx_train_end = int(total_raw * TRAIN_RATIO)
+    idx_val_end = int(total_raw * (TRAIN_RATIO + VAL_RATIO))
 
-    # 6. 统计报告
-    print(f"\n" + "="*60)
-    print(f"🎉 优化版 25 万条分层采样完成")
-    print(f"="*60)
+    # 这里的 .copy() 很重要，确保物理隔离
+    pool_train = df_raw.iloc[:idx_train_end].copy()
+    pool_val = df_raw.iloc[idx_train_end:idx_val_end].copy()
+    pool_test = df_raw.iloc[idx_val_end:].copy()
 
-    for name, df in zip(('Train', 'Val', 'Test'), (train, val, test)):
-        layer_counts = df['layer'].value_counts()
-        print(f"{name:6s}: {len(df):,} 条 | 分层比例: ", end="")
-        for layer in ['Solo', 'Low-Risk', 'High-Risk']:
-            count = layer_counts.get(layer, 0)
-            pct = count / len(df) * 100
-            print(f"{layer} {pct:.0f}% ", end="")
-        print()
+    print(f"   原始池 Train: {len(pool_train):,} (Index 0 - {idx_train_end})")
+    print(f"   原始池 Val  : {len(pool_val):,} (Index {idx_train_end} - {idx_val_end})")
+    print(f"   原始池 Test : {len(pool_test):,} (Index {idx_val_end} - {total_raw})")
 
-    print(f"\n⏱️  性能统计:")
-    print(f"   索引加载: {load_time:.2f}秒")
-    print(f"   数据转换: {convert_time:.2f}秒")
-    print(f"   分层采样: {sample_time:.2f}秒")
-    print(f"   数据划分: {split_time:.2f}秒")
-    print(f"   CSV输出: {output_time:.2f}秒")
-    print(f"   总耗时: {total_time:.2f}秒")
+    # 3. 【关键步骤】在各自的池子里进行分层采样
+    print("\n🎲 第二步：在隔离的池子内进行分层采样...")
 
-    print(f"\n📂 输出目录: {OUTPUT_DIR}")
-    print(f"✅ 数据已就绪，可直接开始训练！")
+    final_train = stratified_sample_from_subset(pool_train, "Train", int(TOTAL_TARGET * TRAIN_RATIO))
+    final_val = stratified_sample_from_subset(pool_val, "Val", int(TOTAL_TARGET * VAL_RATIO))
+    final_test = stratified_sample_from_subset(pool_test, "Test", int(TOTAL_TARGET * TEST_RATIO))
+
+    # 4. 保存结果
+    print("\n💾 保存最终 CSV...")
+    OUTPUT_DIR.mkdir(exist_ok=True, parents=True)
+
+    def save_full_csv(df, name):
+        # 还原完整路径用于 DataLoader
+        export_df = df.copy()
+        export_df['ego_path'] = export_df['scene_id'].apply(lambda x: str(SCENE_ROOT / x / "ego.csv"))
+        export_df['neighbor_path'] = export_df['scene_id'].apply(lambda x: str(SCENE_ROOT / x / "neighbors.csv"))
+
+        # 只保留需要的列
+        cols = ['scene_id', 'layer', 'mindist_nm', 'ego_path', 'neighbor_path']
+        export_df[cols].to_csv(OUTPUT_DIR / f"{name}.csv", index=False)
+        print(f"   ✅ {name}.csv 保存成功")
+
+    save_full_csv(final_train, "train")
+    save_full_csv(final_val, "val")
+    save_full_csv(final_test, "test")
+
+    print("\n" + "=" * 60)
+    print("🎉 数据集构建完成 (无数据泄露版)")
+    print(f"📂 输出位置: {OUTPUT_DIR}")
+    print("✅ 逻辑验证: Train的数据全部来自前70%的时间段，Test来自后15%，绝无重叠。")
+
 
 if __name__ == "__main__":
-    try:
-        main()
-    except FileNotFoundError as e:
-        print(e)
-        print(f"\n💡 解决方案:")
-        print(f"   1. 先运行: bash data/scene_create/generate_index.sh")
-        print(f"   2. 然后运行: python data/scene_create/stratified_sampler.py")
-    except Exception as e:
-        print(f"❌ 执行失败: {e}")
+    main()

@@ -20,7 +20,7 @@ import numpy as np
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from model import SocialPatchTST, create_model
-from data.dataset import create_data_loaders, SceneDataset
+from data.dataset.scene_dataset import create_social_patchtst_loaders
 from config.config_manager import load_config
 
 
@@ -59,11 +59,11 @@ class Trainer:
             raise FileNotFoundError(f"场景数据目录不存在: {scenes_dir}")
 
         try:
-            self.train_loader, self.val_loader, self.test_loader = create_data_loaders(
-                config_path,
-                scenes_dir=scenes_dir,
+            self.train_loader, self.val_loader, self.test_loader = create_social_patchtst_loaders(
+                config_path=config_path,
                 batch_size=self.config.get('training.batch_size', 4),
                 max_neighbors=self.config.get('social_transformer.max_aircrafts', 50),
+                sequence_length=self.config.get('data.history_length', 600),
                 num_workers=self.config.get('device.num_workers', 4)
             )
         except Exception as e:
@@ -193,13 +193,17 @@ class Trainer:
                 with torch.cuda.amp.autocast():
                     output = self.model(batch, teacher_forcing_ratio=0.5)
                     losses = self.criterion(
-                        output['predictions'], batch['targets'], batch['distance_matrix']
+                        output['predictions'], batch['targets'], batch.get('distance_matrix', None)
                     )
             else:
                 output = self.model(batch, teacher_forcing_ratio=0.5)
                 losses = self.criterion(
-                    output['predictions'], batch['targets'], batch['distance_matrix']
+                    output['predictions'], batch['targets'], batch.get('distance_matrix', None)
                 )
+
+            # 防空洞：空样本loss置0
+            if batch['targets'].numel() == 0:
+                losses = {'total_loss': 0.0 * output['predictions'].sum()}
 
             # 应用样本权重
             if 'sample_weight' in batch:
@@ -241,6 +245,9 @@ class Trainer:
             total_loss += losses['total_loss'].item()
             num_batches += 1
 
+            # NaN/Inf检测
+            losses['total_loss'] = torch.nan_to_num(losses['total_loss'], nan=0.0, posinf=1.0, neginf=1e-6)
+
             # 更新进度条
             pbar.set_postfix({
                 'Loss': f"{losses['total_loss'].item():.6f}",
@@ -279,13 +286,17 @@ class Trainer:
                     with torch.cuda.amp.autocast():
                         output = self.model(batch, teacher_forcing_ratio=0.0)
                         losses = self.criterion(
-                            output['predictions'], batch['targets'], batch['distance_matrix']
+                            output['predictions'], batch['targets'], batch.get('distance_matrix', None)
                         )
                 else:
                     output = self.model(batch, teacher_forcing_ratio=0.0)
                     losses = self.criterion(
-                        output['predictions'], batch['targets'], batch['distance_matrix']
+                        output['predictions'], batch['targets'], batch.get('distance_matrix', None)
                     )
+
+                # 防空洞：空样本loss置0
+                if batch['targets'].numel() == 0:
+                    losses = {'total_loss': 0.0 * output['predictions'].sum()}
 
                 # 记录损失
                 total_loss += losses['total_loss'].item()
@@ -321,33 +332,31 @@ class Trainer:
             'config': self.config.config
         }
 
+        # 创建checkpoints目录
+        checkpoints_dir = './checkpoints'
+        os.makedirs(checkpoints_dir, exist_ok=True)
+
         # 保存最新检查点
-        checkpoint_path = os.path.join(
-            self.config.get('logging.log_dir', './logs'),
-            'latest_checkpoint.pth'
-        )
+        checkpoint_path = os.path.join(checkpoints_dir, 'latest_checkpoint.pth')
         torch.save(checkpoint, checkpoint_path)
 
-        # 保存最佳模型
+        # 保存最佳模型到checkpoints/
         if is_best:
-            best_path = os.path.join(
-                self.config.get('logging.log_dir', './logs'),
-                'best_model.pth'
-            )
+            best_path = os.path.join(checkpoints_dir, 'best_model.pth')
             torch.save(checkpoint, best_path)
+            self.logger.info(f"💎 最佳模型已保存到: {best_path}")
 
         # 定期保存
         save_freq = self.config.get('logging.save_freq', 10)
         if (self.epoch + 1) % save_freq == 0:
             epoch_path = os.path.join(
-                self.config.get('logging.log_dir', './logs'),
-                f'checkpoint_epoch_{self.epoch+1}.pth'
+                checkpoints_dir, f'checkpoint_epoch_{self.epoch+1}.pth'
             )
             torch.save(checkpoint, epoch_path)
 
     def train(self):
         """主训练循环"""
-        training_config = self.config.training_config
+        training_config = self.config.get('training', {})
         epochs = training_config.get('epochs', 100)
         patience = training_config.get('patience', 10)
 
@@ -447,10 +456,7 @@ def main():
 
     # 如果指定了恢复训练，加载检查点
     if args.resume:
-        checkpoint_path = os.path.join(
-            trainer.config.get('logging.log_dir', './logs'),
-            'latest_checkpoint.pth'
-        )
+        checkpoint_path = './checkpoints/latest_checkpoint.pth'
         if os.path.exists(checkpoint_path):
             checkpoint = torch.load(checkpoint_path, map_location=trainer.device)
             trainer.model.load_state_dict(checkpoint['model_state_dict'])

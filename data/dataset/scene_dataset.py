@@ -20,6 +20,52 @@ from config.config_manager import load_config
 
 warnings.filterwarnings('ignore')
 
+
+class PrecomputedScaler:
+    """使用预计算均值和标准差的标准化器"""
+
+    def __init__(self, mean: np.ndarray, std: np.ndarray):
+        """
+        初始化预计算标准化器
+
+        Args:
+            mean: 特征均值数组
+            std: 特征标准差数组
+        """
+        self.mean_ = mean.astype(np.float64)
+        self.scale_ = std.astype(np.float64)
+
+        # 避免除零错误
+        self.scale_[self.scale_ == 0] = 1.0
+
+    def transform(self, X: np.ndarray) -> np.ndarray:
+        """
+        应用标准化变换
+
+        Args:
+            X: 输入数据 [n_samples, n_features]
+
+        Returns:
+            标准化后的数据
+        """
+        return (X.astype(np.float64) - self.mean_) / self.scale_
+
+    def fit_transform(self, X: np.ndarray) -> np.ndarray:
+        """兼容方法，直接返回transform结果"""
+        return self.transform(X)
+
+    def inverse_transform(self, X: np.ndarray) -> np.ndarray:
+        """
+        反向标准化变换
+
+        Args:
+            X: 标准化后的数据
+
+        Returns:
+            反标准化后的数据
+        """
+        return (X.astype(np.float64) * self.scale_) + self.mean_
+
 # 实际CSV中的列名定义
 CSV_FEATURE_COLUMNS = {
     'temporal_features': [
@@ -59,25 +105,39 @@ class SocialPatchTSTDataset(Dataset):
         self.target_features = CSV_FEATURE_COLUMNS['target_features']
 
         print(f"📂 从路径文件加载场景: {paths_file}")
-        # 从txt文件读取场景路径
+        # 高效读取路径文件，去重处理
         self.scenes = []
+        seen_scenes = set()  # 防重复
+
         if paths_file and os.path.exists(paths_file):
             with open(paths_file, 'r') as f:
-                for line in f:
+                for line_num, line in enumerate(f):
                     scene_path = line.strip()
-                    if scene_path:
-                        scene_name = os.path.basename(scene_path)
-                        ego_path = os.path.join(scene_path, "ego.csv")
-                        neighbor_path = os.path.join(scene_path, "neighbors.csv")
+                    if not scene_path:
+                        continue
 
-                        if os.path.exists(ego_path) and os.path.exists(neighbor_path):
-                            self.scenes.append({
-                                'scene_id': scene_name,
-                                'ego_path': ego_path,
-                                'neighbor_path': neighbor_path,
-                                'layer': self._extract_layer_from_name(scene_name)
-                            })
-        print(f"✅ 发现 {len(self.scenes)} 个有效场景")
+                    scene_name = os.path.basename(scene_path)
+
+                    # 防重复检查
+                    if scene_name in seen_scenes:
+                        continue
+                    seen_scenes.add(scene_name)
+
+                    ego_path = os.path.join(scene_path, "ego.csv")
+                    neighbor_path = os.path.join(scene_path, "neighbors.csv")
+
+                    self.scenes.append({
+                        'scene_id': scene_name,
+                        'ego_path': ego_path,
+                        'neighbor_path': neighbor_path,
+                        'layer': self._extract_layer_from_name(scene_name)
+                    })
+
+                    # 减少打印频率 - 每50k个场景打印一次
+                    if len(self.scenes) % 50000 == 0:
+                        print(f"   已加载 {len(self.scenes)} 个唯一场景...")
+
+        print(f"✅ 发现 {len(self.scenes)} 个唯一场景")
 
         # 快速验证数据完整性
         print("🔍 验证数据完整性...")
@@ -93,64 +153,52 @@ class SocialPatchTSTDataset(Dataset):
         return "default"
 
     def _verify_data_integrity(self):
-        """验证数据完整性"""
-        # 抽样验证前100个场景
-        sample_size = min(100, len(self.scenes))
-        valid_count = 0
-
-        for idx in range(sample_size):
-            scene = self.scenes[idx]
-            ego_path = scene['ego_path']
-            neighbor_path = scene['neighbor_path']
-
-            if os.path.exists(ego_path) and os.path.exists(neighbor_path):
-                valid_count += 1
-
-        validity_rate = valid_count / sample_size
-        if validity_rate >= 0.9:
-            print(f"✅ 数据完整性良好 ({validity_rate:.1%})，使用全部场景")
-            self.valid_scenes = self.scenes
-        else:
-            print(f"⚠️  数据完整性较低 ({validity_rate:.1%})，建议检查数据")
-            self.valid_scenes = self.scenes  # 仍使用全部数据
-
-        print(f"最终使用场景数量: {len(self.valid_scenes)}")
+        """跳过数据完整性验证，避免扫描文件夹"""
+        print("⚡ 跳过完整性验证，直接使用路径文件中的场景")
+        self.valid_scenes = self.scenes
+        print(f"✅ 直接使用全部场景数量: {len(self.valid_scenes)}")
 
     def _initialize_scalers(self):
-        """初始化数据标准化器"""
-        print("🔧 初始化数据标准化器...")
+        """从配置文件初始化数据标准化器，使用预计算的统计信息"""
+        print("🔧 从配置文件初始化数据标准化器...")
 
-        sample_size = min(50, len(self.valid_scenes))
-        all_features = []
+        try:
+            # 加载配置文件
+            config_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+                                     "config", "social_patchtst_config.yaml")
+            config = load_config(config_path)
 
-        for i in range(sample_size):
-            try:
-                scene = self.valid_scenes[i]
+            # 获取统计数据
+            statistics = config.get('data.statistics', {})
 
-                # 加载ego数据并处理特征
-                ego_df = pd.read_csv(scene['ego_path'])
-                ego_features = self._process_features(ego_df)
-                all_features.append(ego_features)
+            if not statistics:
+                print("⚠️  配置文件中未找到统计信息，将使用原始数据")
+                self.feature_scaler = None
+                return
 
-                # 加载邻居数据样本并处理特征
-                neighbors_df = pd.read_csv(scene['neighbor_path'])
-                # 处理前几个邻居来收集特征
-                neighbor_groups = neighbors_df.groupby('target_address')
-                for aircraft_id, neighbor_group in list(neighbor_groups)[:3]:  # 限制为前3个邻居
-                    neighbor_features = self._process_features(neighbor_group)
-                    all_features.append(neighbor_features)
+            # 使用主要特征的统计信息 (latitude, longitude, flight_level, vx, vy)
+            main_stats = statistics.get('main_features', {})
 
-            except Exception as e:
-                continue
+            if not main_stats.get('mean') or not main_stats.get('std'):
+                print("⚠️  配置文件中缺少主要特征的统计信息，将使用原始数据")
+                self.feature_scaler = None
+                return
 
-        if all_features:
-            all_features = np.vstack(all_features)
-            self.feature_scaler = StandardScaler()
-            self.feature_scaler.fit(all_features)
-            print(f"✅ 标准化器已拟合，特征维度: {all_features.shape}")
-        else:
+            # 创建自定义的标准化器，使用预计算的均值和标准差
+            self.feature_scaler = PrecomputedScaler(
+                mean=np.array(main_stats['mean']),
+                std=np.array(main_stats['std'])
+            )
+
+            print(f"✅ 标准化器已从配置文件加载")
+            print(f"   特征顺序: {main_stats['feature_names']}")
+            print(f"   均值: {main_stats['mean']}")
+            print(f"   标准差: {main_stats['std']}")
+
+        except Exception as e:
+            print(f"⚠️  从配置文件加载统计信息失败: {e}")
+            print("   将使用原始数据")
             self.feature_scaler = None
-            print("⚠️  无法拟合标准化器，将使用原始数据")
 
     def _process_features(self, df):
         """
@@ -218,21 +266,27 @@ class SocialPatchTSTDataset(Dataset):
         return len(self.valid_scenes)
 
     def __getitem__(self, idx):
-        """获取单个数据样本"""
+        """获取单个数据样本，转换为模型期望的格式"""
         scene_data = self._load_single_scene(idx)
 
         if scene_data is None:
             # 返回空样本
+            n_aircrafts = self.max_neighbors + 1  # ego + neighbors
+            seq_len = self.sequence_length
+            n_temporal_features = len(self.temporal_features)
+
             return {
                 'scene_id': f"empty_{idx}",
-                'ego_features': torch.zeros(self.sequence_length, 5),  # 5维特征
-                'neighbor_features': torch.zeros(self.max_neighbors, self.sequence_length, 5),  # 5维特征
-                'target': torch.zeros(2),  # [lat, lon]
+                'temporal': torch.zeros(n_aircrafts, seq_len, n_temporal_features),
+                'spatial': torch.zeros(n_aircrafts, 2),  # lat, lon
+                'targets': torch.zeros(n_aircrafts, 120, 4),  # pred_len, targets
+                'distance_matrix': torch.eye(n_aircrafts),  # 单位矩阵
+                'aircraft_ids': [f"empty_{i}" for i in range(n_aircrafts)],
                 'layer': 'Unknown'
             }
 
         # 处理ego特征
-        ego_features = scene_data['ego_features']
+        ego_features = scene_data['ego_features']  # [seq_len, 5]
         if self.feature_scaler is not None:
             ego_features = self.feature_scaler.transform(ego_features)
 
@@ -240,15 +294,27 @@ class SocialPatchTSTDataset(Dataset):
         if len(ego_features) > self.sequence_length:
             ego_features = ego_features[:self.sequence_length]
         elif len(ego_features) < self.sequence_length:
-            # 填充
             padding = np.zeros((self.sequence_length - len(ego_features), ego_features.shape[1]))
             ego_features = np.vstack([ego_features, padding])
 
         # 处理邻居特征
-        neighbor_features = scene_data['neighbor_features']
-        neighbor_tensor = torch.zeros(self.max_neighbors, self.sequence_length, len(self.temporal_features))
+        neighbor_features_list = scene_data['neighbor_features']
+        n_aircrafts = min(len(neighbor_features_list) + 1, self.max_neighbors + 1)  # +1 for ego
 
-        for i, neigh_feat in enumerate(neighbor_features[:self.max_neighbors]):
+        # 初始化张量
+        temporal_data = torch.zeros(n_aircrafts, self.sequence_length, len(self.temporal_features))
+        spatial_data = torch.zeros(n_aircrafts, 2)  # lat, lon
+        aircraft_ids = ['ego']
+
+        # 第0架飞机是ego
+        temporal_data[0] = torch.from_numpy(ego_features).float()
+        spatial_data[0] = torch.from_numpy(ego_features[-1, :2]).float()  # 最后位置的lat, lon
+
+        # 填充邻居数据
+        for i, neigh_feat in enumerate(neighbor_features_list[:self.max_neighbors]):
+            if i + 1 >= n_aircrafts:
+                break
+
             if neigh_feat.ndim == 1:
                 neigh_feat = neigh_feat.reshape(1, -1)
 
@@ -261,17 +327,32 @@ class SocialPatchTSTDataset(Dataset):
                 padding = np.zeros((self.sequence_length - len(neigh_feat), neigh_feat.shape[1]))
                 neigh_feat = np.vstack([neigh_feat, padding])
 
-            neighbor_tensor[i] = torch.from_numpy(neigh_feat).float()
+            temporal_data[i + 1] = torch.from_numpy(neigh_feat).float()
+            spatial_data[i + 1] = torch.from_numpy(neigh_feat[-1, :2]).float()
+            aircraft_ids.append(f"neighbor_{i}")
 
-        # 创建目标（使用最后一个时间步的位置作为预测目标）
-        # 新的特征顺序: [latitude(0), longitude(1), flight_level(2), vx(3), vy(4)]
-        target_data = ego_features[-1, [0, 1]]  # [lat, lon]
+        # 创建距离矩阵 (基于当前位置)
+        distance_matrix = torch.zeros(n_aircrafts, n_aircrafts)
+        for i in range(n_aircrafts):
+            for j in range(n_aircrafts):
+                if i != j:
+                    # 计算欧几里得距离
+                    dist = torch.norm(spatial_data[i] - spatial_data[j])
+                    distance_matrix[i, j] = dist
 
+        # 创建目标数据 (基于最后的位置)
+        # 简化：目标是预测未来位置，这里使用最后位置作为目标基础
+        last_position = temporal_data[:, -1, :4]  # [n_aircrafts, 4] - lat,lon,flight_level,vx
+        targets = last_position.unsqueeze(1).repeat(1, 120, 1)  # [n_aircrafts, 120, 4]
+
+        # 返回数据，不要添加batch维度（DataLoader会处理）
         return {
             'scene_id': scene_data['scene_id'],
-            'ego_features': torch.from_numpy(ego_features).float(),
-            'neighbor_features': neighbor_tensor,
-            'target': torch.from_numpy(target_data).float(),
+            'temporal': temporal_data,  # [n_aircrafts, seq_len, features]
+            'spatial': spatial_data,    # [n_aircrafts, 2]
+            'targets': targets,         # [n_aircrafts, 120, 4]
+            'distance_matrix': distance_matrix,  # [n_aircrafts, n_aircrafts]
+            'aircraft_ids': aircraft_ids,  # List of IDs
             'layer': scene_data['layer']
         }
 
@@ -337,19 +418,25 @@ def create_social_patchtst_loaders(config_path: str = None, batch_size: int = 32
         batch_size=batch_size,
         shuffle=True,
         num_workers=num_workers,
-        drop_last=True
+        drop_last=True,
+        persistent_workers=num_workers > 0,  # 如果有worker就保持存活
+        pin_memory=True  # 加速CPU到GPU传输
     )
     val_loader = DataLoader(
         val_dataset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=num_workers
+        num_workers=num_workers,
+        persistent_workers=num_workers > 0,
+        pin_memory=True
     )
     test_loader = DataLoader(
         test_dataset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=num_workers
+        num_workers=num_workers,
+        persistent_workers=num_workers > 0,
+        pin_memory=True
     )
 
     print("✅ 数据加载器创建成功!")

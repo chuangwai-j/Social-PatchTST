@@ -54,4 +54,3 @@ tail -5 scene_index.tsv
 
 echo
 echo "🎉 索引已就绪！现在可以运行优化版采样脚本："
-echo "   python data/dataset/optimized_sampler.py"

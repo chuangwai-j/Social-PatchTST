@@ -146,11 +146,20 @@ class MultiHeadAttentionWithRPE(nn.Module):
         if self.rpe is not None:
             rpe_bias = self.rpe(distance_matrix, temperature)
             # rpe_bias: [batch_size, 1, n_aircrafts, n_aircrafts]
+            # 确保batch维度匹配
+            if rpe_bias.size(0) != batch_size:
+                # 如果rpe_bias的batch维度不匹配，需要扩展
+                repeat_factor = batch_size // rpe_bias.size(0)
+                rpe_bias = rpe_bias.repeat(repeat_factor, 1, 1, 1)
             scores = scores + rpe_bias
 
         # 应用掩码
         if mask is not None:
-            mask = mask.unsqueeze(1).unsqueeze(1)  # [batch_size, 1, 1, n_aircrafts, n_aircrafts]
+            # mask: [batch_size, n_aircrafts, n_aircrafts]
+            # scores: [batch_size, n_heads, n_aircrafts, n_aircrafts]
+            # 需要扩展mask的n_heads维度
+            mask = mask.unsqueeze(1)  # [batch_size, 1, n_aircrafts, n_aircrafts]
+            mask = mask.expand(-1, self.n_heads, -1, -1)  # [batch_size, n_heads, n_aircrafts, n_aircrafts]
             scores = scores.masked_fill(mask == 0, -1e9)
 
         # 计算注意力权重
