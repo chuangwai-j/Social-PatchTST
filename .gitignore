@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.idea/
+*.iml
+.claude
+data/calculate/
+data/parser/
+data/scene_create/
+logs/
+data/dataset/__pycache__/
