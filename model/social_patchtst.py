@@ -70,58 +70,88 @@ class SocialPatchTST(nn.Module):
     def forward(self, batch: Dict[str, torch.Tensor],
                 teacher_forcing_ratio: float = 0.5) -> Dict[str, torch.Tensor]:
         """
-        前向传播
+        前向传播 - 按解剖表规范
 
         Args:
-            batch: 批次数据，包含：
-                - temporal: [batch_size, n_aircrafts, seq_len, n_temporal_features]
-                - spatial: [batch_size, n_aircrafts, 2] (lat, lon)
-                - targets: [batch_size, n_aircrafts, prediction_length, n_targets]
-                - distance_matrix: [batch_size, n_aircrafts, n_aircrafts]
-                - aircraft_ids: 飞机ID列表
+            batch: 批次数据，应包含：
+                - x_ego: Ego飞机时序 (N, T=120, d=5)
+                - x_nbr: 邻居时序 (N, T=120, K=20, d=5)
+                - dist_mx: 相对距离 (N, T=120, K)
             teacher_forcing_ratio: 教师强制比例
 
         Returns:
-            预测结果字典
+            预测结果字典，包含4个头的预测
         """
-        temporal_data = batch['temporal']  # [batch_size, n_aircrafts, seq_len, n_temporal_features]
-        spatial_data = batch['spatial']    # [batch_size, n_aircrafts, 2]
-        targets = batch.get('targets')     # [batch_size, n_aircrafts, prediction_length, n_targets]
-        distance_matrix = batch['distance_matrix']  # [batch_size, n_aircrafts, n_aircrafts]
-        aircraft_ids = batch.get('aircraft_ids')   # 飞机ID列表
+        # 从batch中提取解剖表规范的输入
+        x_ego = batch.get('temporal')  # (N, T=120, d=5) - 如果是单机版本
+        if x_ego is None:
+            # 如果temporal是多机格式，取第一架飞机作为ego
+            temporal_data = batch['temporal']  # [batch_size, n_aircrafts, seq_len, n_temporal_features]
+            x_ego = temporal_data[:, 0, :, :]  # 取第一架飞机作为ego
 
-        batch_size, n_aircrafts, seq_len, n_temporal_features = temporal_data.shape
+        # 获取邻居数据 - 需要构建符合解剖表的格式
+        if 'x_nbr' in batch and 'dist_mx' in batch:
+            x_nbr = batch['x_nbr']  # (N, T=120, K=20, d=5)
+            dist_mx = batch['dist_mx']  # (N, T=120, K)
+        else:
+            # 从现有数据构建邻居信息
+            temporal_data = batch['temporal']  # [batch_size, n_aircrafts, seq_len, n_temporal_features]
+            distance_matrix = batch['distance_matrix']  # [batch_size, n_aircrafts, n_aircrafts]
+
+            batch_size, n_aircrafts, seq_len, n_temporal_features = temporal_data.shape
+
+            # 构建邻居特征 (N, T=120, K=20, d=5)
+            # 这里简化处理：使用其他飞机作为邻居
+            if n_aircrafts > 1:
+                # 取最多20个邻居
+                K = min(19, n_aircrafts - 1)  # 除了ego外的邻居
+                x_nbr_list = []
+                dist_mx_list = []
+
+                for i in range(batch_size):
+                    ego_temporal = temporal_data[i, 0, :, :]  # ego飞机
+                    neighbor_temporal = temporal_data[i, 1:1+K, :, :]  # 邻居飞机
+                    neighbor_distances = distance_matrix[i, 0, 1:1+K]  # ego到邻居的距离
+
+                    # 扩展维度到时序
+                    neighbor_distances_expanded = neighbor_distances.unsqueeze(1).expand(-1, seq_len, -1)
+
+                    x_nbr_list.append(neighbor_temporal)
+                    dist_mx_list.append(neighbor_distances_expanded)
+
+                x_nbr = torch.stack(x_nbr_list, dim=0)  # (batch_size, K, seq_len, d)
+                x_nbr = x_nbr.permute(0, 2, 1, 3)  # (batch_size, seq_len, K, d)
+                dist_mx = torch.stack(dist_mx_list, dim=0)  # (batch_size, seq_len, K)
+            else:
+                # 如果没有邻居，创建虚拟数据
+                K = 20
+                x_nbr = torch.zeros(batch_size, seq_len, K, n_temporal_features, device=x_ego.device)
+                dist_mx = torch.full((batch_size, seq_len, K), 9999.0, device=x_ego.device)  # 很远的距离
 
         # === 模块一：Temporal Encoder (PatchTST) ===
-        # 学习每架飞机的时序模式
-        encoded_temporal, n_patches = self.temporal_encoder(temporal_data)
-        # encoded_temporal: [batch_size, n_aircrafts, n_patches, d_model]
+        # 学习ego飞机的时序模式
+        encoded_temporal, n_patches = self.temporal_encoder(x_ego)
+        # encoded_temporal: (N, n_patches, d_model)
 
         # === 模块二：Social Encoder ===
         # 学习多架飞机之间的社交交互
-        social_aware_features = self.social_encoder(
-            encoded_temporal, distance_matrix, aircraft_ids
-        )
-        # social_aware_features: [batch_size, n_aircrafts, n_patches, d_model]
+        social_aware_features = self.social_encoder(x_nbr, dist_mx)
+        # social_aware_features: (N, T, d_social=512)
 
-        # === 模块三：Prediction Decoder ===
-        # 基于社交感知特征生成未来轨迹预测
-        raw_predictions = self.prediction_decoder(
-            social_aware_features, targets, teacher_forcing_ratio
-        )
-        # raw_predictions: [batch_size, n_aircrafts, prediction_patches, output_dim]
+        # === 模块三：融合方式（解剖表规范）===
+        # (N, T, d) + (N, T, d_social) → (N, T, d + d_social)
+        fused_features = torch.cat([x_ego, social_aware_features], dim=-1)
+        # fused_features: (N, T=120, d + d_social=517)
 
-        # === 后处理 ===
-        # 反向Patching还原为完整时间序列
-        final_predictions = self.reverse_patching(raw_predictions, 120)  # 120个预测点
-
-        # 轨迹后处理（平滑等）
-        final_predictions = self.post_processor(final_predictions)
+        # === 模块四：MLP Heads ===
+        # 基于融合特征生成4个预测头
+        raw_predictions = self.prediction_decoder(fused_features)
 
         return {
-            'predictions': final_predictions,
+            'predictions': raw_predictions,
             'encoded_temporal': encoded_temporal,
             'social_aware_features': social_aware_features,
+            'fused_features': fused_features,
             'n_patches': n_patches
         }
 

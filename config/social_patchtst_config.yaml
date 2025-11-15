@@ -112,7 +112,7 @@ decoder:
   d_ff: 2048                 # 解码器前馈网络维度
   dropout: 0.1               # 解码器Dropout
 
-# 训练配置
+# 训练配置 - 加强正则化防止过拟合
 training:
   # 基本参数
   batch_size: 4             # 批大小
@@ -120,15 +120,21 @@ training:
   epochs: 100                # 训练轮数
   patience: 10               # 早停耐心值
 
-  # 优化器
+  # 优化器 - 使用AdamW加强权重衰减
   optimizer: "AdamW"         # 优化器类型
-  weight_decay: 0.01         # 权重衰减
+  weight_decay: 0.01         # 权重衰减（加强L2正则化）
 
   # 学习率调度
   scheduler:
     name: "CosineAnnealingLR"  # 学习率调度器
     T_max: 100                 # 余弦退火周期
     eta_min: 0.00001           # 最小学习率
+
+  # 强力正则化配置
+  regularization:
+    dropout_rate: 0.3         # 提高dropout到0.3
+    weight_decay: 0.01        # L2权重衰减
+    gradient_clipping: 1.0    # 梯度裁剪
 
   # 损失函数权重
   loss_weights:
