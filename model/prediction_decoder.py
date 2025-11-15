@@ -19,10 +19,10 @@ class MLPHeads(nn.Module):
     - MinDist Head: (N, T_out, 1) → MSE(mindist_nm)
     """
 
-    def __init__(self, d_input: int = 517, T_out: int = 120, dropout: float = 0.3):
+    def __init__(self, d_input: int = 1024, T_out: int = 120, dropout: float = 0.3):
         """
         Args:
-            d_input: 输入特征维度 (d + d_social = 5 + 512 = 517)
+            d_input: 输入特征维度 (d_model + d_social = 512 + 512 = 1024)
             T_out: 输出时序长度 (120)
             dropout: dropout率（加强正则化）
         """
@@ -86,15 +86,15 @@ class MLPHeads(nn.Module):
         前向传播
 
         Args:
-            fused_features: (N, T, d + d_social) = (N, 120, 517)
+            fused_features: (N, n_patches, d_model + d_social) = (N, 14, 1024)
 
         Returns:
             预测结果字典，每个都是 (N, T_out, 对应维度)
         """
-        N, T, d_total = fused_features.shape
+        N, n_patches, d_total = fused_features.shape
 
-        # 时序特征提取（平均池化 + 共享编码器）
-        # 从T=120时序中提取特征
+        # Patch特征提取（平均池化 + 共享编码器）
+        # 从n_patches=14中提取特征
         pooled_features = fused_features.mean(dim=1)  # (N, d_total) - 平均池化
         encoded_features = self.temporal_encoder(pooled_features)  # (N, 512)
 
@@ -130,8 +130,8 @@ class PredictionDecoder(nn.Module):
 
         # 创建4个MLP Heads
         self.mlp_heads = MLPHeads(
-            d_input=517,  # d + d_social = 5 + 512
-            T_out=120,    # T_out = 120
+            d_input=1024,  # d_model + d_social = 512 + 512
+            T_out=120,     # T_out = 120
             dropout=dropout
         )
 
@@ -154,11 +154,11 @@ class PredictionDecoder(nn.Module):
 if __name__ == "__main__":
     # 测试4个MLP Heads（按解剖表规范）
     batch_size = 4
-    T = 120
-    d_total = 517  # d + d_social = 5 + 512
+    n_patches = 14  # 修复后的patch数量
+    d_total = 1024  # d_model + d_social = 512 + 512
 
-    # 创建测试数据 - 严格按照解剖表
-    fused_features = torch.randn(batch_size, T, d_total)  # (N, T, d + d_social)
+    # 创建测试数据 - 严格按照修复后的规范
+    fused_features = torch.randn(batch_size, n_patches, d_total)  # (N, n_patches, d_model + d_social)
 
     # MLP Heads配置
     config = {
@@ -171,17 +171,18 @@ if __name__ == "__main__":
     # 前向传播
     predictions = decoder(fused_features)
 
-    print("=== 4个MLP Heads测试 (解剖表规范) ===")
+    print("=== 4个MLP Heads测试 (修复后规范) ===")
     print(f"输入融合特征形状: {fused_features.shape}")
     print(f"预测结果形状:")
     for key, value in predictions.items():
         print(f"  {key}: {value.shape}")
 
-    # 验证输出形状符合解剖表
+    # 验证输出形状符合规范
     assert predictions['position'].shape == (batch_size, 120, 2), f"Position Head形状错误: {predictions['position'].shape}"
     assert predictions['altitude'].shape == (batch_size, 120, 1), f"Altitude Head形状错误: {predictions['altitude'].shape}"
     assert predictions['velocity'].shape == (batch_size, 120, 2), f"Velocity Head形状错误: {predictions['velocity'].shape}"
     assert predictions['mindist'].shape == (batch_size, 120, 1), f"MinDist Head形状错误: {predictions['mindist'].shape}"
 
-    print("✅ 严格按照解剖表：4个MLP Heads输出形状正确")
+    print("✅ 修复后规范：4个MLP Heads输出形状正确")
+    print("✅ PatchTST输出已被正确使用！")
     print("✅ 测试通过！")

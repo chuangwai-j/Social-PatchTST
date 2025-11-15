@@ -133,10 +133,6 @@ class SocialPatchTSTDataset(Dataset):
                         'layer': self._extract_layer_from_name(scene_name)
                     })
 
-                    # 减少打印频率 - 每50k个场景打印一次
-                    if len(self.scenes) % 50000 == 0:
-                        print(f"   已加载 {len(self.scenes)} 个唯一场景...")
-
         print(f"✅ 发现 {len(self.scenes)} 个唯一场景")
 
         # 快速验证数据完整性
@@ -234,33 +230,43 @@ class SocialPatchTSTDataset(Dataset):
         scene_id = scene['scene_id']
 
         try:
-            # 加载ego数据
+            # 1. 加载ego数据 (这个必须有)
             ego_df = pd.read_csv(scene['ego_path'])
             ego_features = self._process_features(ego_df)  # [seq_len, 5]
 
-            # 加载neighbor数据
-            neighbors_df = pd.read_csv(scene['neighbor_path'])
-
-            # 选择最多max_neighbors个邻居（保持顺序）
-            if len(neighbors_df) > self.max_neighbors:
-                neighbors_df = neighbors_df.head(self.max_neighbors)
-
+            # 2. --- 修复点：正确处理独自飞行场景 ---
             neighbor_features_list = []
-            # 按飞机ID分组处理邻居数据
-            for aircraft_id, neighbor_group in neighbors_df.groupby('target_address'):
-                neighbor_features = self._process_features(neighbor_group)
-                neighbor_features_list.append(neighbor_features)
 
+            # 检查 neighbors.csv 是否存在
+            if os.path.exists(scene['neighbor_path']):
+                # 如果存在，才加载邻居数据
+                neighbors_df = pd.read_csv(scene['neighbor_path'])
+
+                # 选择最多max_neighbors个邻居（保持顺序）
+                if len(neighbors_df) > self.max_neighbors:
+                    neighbors_df = neighbors_df.head(self.max_neighbors)
+
+                # 按飞机ID分组处理邻居数据
+                for aircraft_id, neighbor_group in neighbors_df.groupby('target_address'):
+                    neighbor_features = self._process_features(neighbor_group)
+                    neighbor_features_list.append(neighbor_features)
+            else:
+                # 如果 neighbors.csv 不存在 (独自飞行场景), neighbor_features_list 保持为空
+                # 这是正常情况，不需要警告
+                pass
+
+            # 3. 返回正确的数据，而不是在文件不存在时返回 None
             return {
                 'scene_id': scene_id,
                 'ego_features': ego_features,
-                'neighbor_features': neighbor_features_list,
+                'neighbor_features': neighbor_features_list,  # 对于独自飞行场景，这里是 []
                 'layer': scene['layer']
             }
 
         except Exception as e:
+            # 这里的 except 现在只会捕获真正的IO错误（比如 ego.csv 损坏）
             print(f"⚠️  加载场景 {scene_id} 失败: {e}")
-            return None
+            return None  # 这种情况才返回 None
 
     def __len__(self):
         return len(self.valid_scenes)
@@ -357,6 +363,66 @@ class SocialPatchTSTDataset(Dataset):
         }
 
 
+def custom_collate_fn(batch):
+    """
+    自定义collate函数，处理不同场景中飞机数量不一致的问题
+    """
+    if not batch:
+        return {}
+
+    # 找到batch中最大的飞机数量
+    max_aircrafts = max(item['temporal'].shape[0] for item in batch)
+    seq_len = batch[0]['temporal'].shape[1]
+    n_features = batch[0]['temporal'].shape[2]
+
+    # 初始化batch张量
+    batch_size = len(batch)
+    temporal_batch = torch.zeros(batch_size, max_aircrafts, seq_len, n_features)
+    spatial_batch = torch.zeros(batch_size, max_aircrafts, 2)
+    targets_batch = torch.zeros(batch_size, max_aircrafts, 120, 4)
+    distance_matrix_batch = torch.zeros(batch_size, max_aircrafts, max_aircrafts)
+
+    # 填充数据
+    scene_ids = []
+    aircraft_ids_batch = []
+    layers = []
+
+    for i, item in enumerate(batch):
+        n_aircrafts = item['temporal'].shape[0]
+
+        # 复制实际数据
+        temporal_batch[i, :n_aircrafts] = item['temporal']
+        spatial_batch[i, :n_aircrafts] = item['spatial']
+        targets_batch[i, :n_aircrafts] = item['targets']
+        distance_matrix_batch[i, :n_aircrafts, :n_aircrafts] = item['distance_matrix']
+
+        # 填充剩余部分
+        if n_aircrafts < max_aircrafts:
+            # 用零填充
+            temporal_batch[i, n_aircrafts:] = 0
+            spatial_batch[i, n_aircrafts:] = 0
+            targets_batch[i, n_aircrafts:] = 0
+            distance_matrix_batch[i, n_aircrafts:, :] = 0
+            distance_matrix_batch[i, :, n_aircrafts:] = 0
+
+            # 对角线设为1（避免无效距离）
+            distance_matrix_batch[i, n_aircrafts:, n_aircrafts:] = torch.eye(max_aircrafts - n_aircrafts)
+
+        scene_ids.append(item['scene_id'])
+        aircraft_ids_batch.append(item['aircraft_ids'] + [f"pad_{j}" for j in range(max_aircrafts - n_aircrafts)])
+        layers.append(item['layer'])
+
+    return {
+        'scene_id': scene_ids,
+        'temporal': temporal_batch,
+        'spatial': spatial_batch,
+        'targets': targets_batch,
+        'distance_matrix': distance_matrix_batch,
+        'aircraft_ids': aircraft_ids_batch,
+        'layer': layers
+    }
+
+
 def create_social_patchtst_loaders(config_path: str = None, batch_size: int = 32,
                                   max_neighbors: int = 20, sequence_length: int = 600,
                                   num_workers: int = 4) -> Tuple[DataLoader, DataLoader, DataLoader]:
@@ -412,7 +478,7 @@ def create_social_patchtst_loaders(config_path: str = None, batch_size: int = 32
     val_dataset = SocialPatchTSTDataset(str(scenes_path), max_neighbors, sequence_length, str(val_paths_file))
     test_dataset = SocialPatchTSTDataset(str(scenes_path), max_neighbors, sequence_length, str(test_paths_file))
 
-    # 创建数据加载器
+    # 创建数据加载器，使用自定义collate函数
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
@@ -420,7 +486,8 @@ def create_social_patchtst_loaders(config_path: str = None, batch_size: int = 32
         num_workers=num_workers,
         drop_last=True,
         persistent_workers=num_workers > 0,  # 如果有worker就保持存活
-        pin_memory=True  # 加速CPU到GPU传输
+        pin_memory=True,  # 加速CPU到GPU传输
+        collate_fn=custom_collate_fn  # 使用自定义collate函数处理变长数据
     )
     val_loader = DataLoader(
         val_dataset,
@@ -428,7 +495,8 @@ def create_social_patchtst_loaders(config_path: str = None, batch_size: int = 32
         shuffle=False,
         num_workers=num_workers,
         persistent_workers=num_workers > 0,
-        pin_memory=True
+        pin_memory=True,
+        collate_fn=custom_collate_fn  # 使用自定义collate函数处理变长数据
     )
     test_loader = DataLoader(
         test_dataset,
@@ -436,7 +504,8 @@ def create_social_patchtst_loaders(config_path: str = None, batch_size: int = 32
         shuffle=False,
         num_workers=num_workers,
         persistent_workers=num_workers > 0,
-        pin_memory=True
+        pin_memory=True,
+        collate_fn=custom_collate_fn  # 使用自定义collate函数处理变长数据
     )
 
     print("✅ 数据加载器创建成功!")
